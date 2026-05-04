@@ -20,7 +20,6 @@ public sealed partial class SettingsDialog : ContentDialog
     private readonly List<(PinOutput output, ComboBox typePicker, ComboBox gpioPicker, Border badge)> _outputRows = new();
     private TextBlock? _statusText;
     private bool _suppressSelectionChanged;
-    private byte _savedOut2Pin; // saved OUT 3/4 pin before SUB OUT → S/PDIF redirect
 
     // I2S configuration controls
     private ComboBox? _bckPinCombo;
@@ -596,77 +595,35 @@ public sealed partial class SettingsDialog : ContentDialog
 
         if (newType == OutputSlotType.Spdif)
         {
-            // Try direct slot 2 first (works with spdif-sub firmware where SPDIF 3 = slot 2).
-            const int PdmSlot = 2;
-            var directStatus = await Task.Run(() => _vm.SetOutputSlotType(PdmSlot, OutputSlotType.Spdif));
-            if (directStatus == PinConfigResult.Success)
+            // Try to set SUB OUT slot (slot 2) as S/PDIF.
+            // This works with spdif-sub firmware where SPDIF 3 = slot 2.
+            // On stock firmware, this call will fail with PinInUse or InvalidOutput error.
+            const int SubSlot = 2;
+            var status = await Task.Run(() => _vm.SetOutputSlotType(SubSlot, OutputSlotType.Spdif));
+            
+            if (status == PinConfigResult.Success)
             {
-                ShowStatus("SUB OUT → S/PDIF (slot 2)", isError: false);
-                _savedOut2Pin = 0; // direct mode, no redirect active
+                ShowStatus("SUB OUT → S/PDIF (GPIO 10)", isError: false);
                 return;
             }
 
-            // Firmware doesn't support slot 2 (stock firmware). Fall back:
-            // redirect OUT 3/4 to the PDM GPIO pin so the sub circuit gets S/PDIF.
-            var out2Row = _outputRows.FirstOrDefault(r => r.output.Id == 1);
-            if (out2Row == default)
-            {
-                _suppressSelectionChanged = true;
-                combo.SelectedIndex = 0;
-                _suppressSelectionChanged = false;
-                ShowStatus("SUB OUT S/PDIF not supported by this firmware", isError: true);
-                return;
-            }
-
-            byte pdmPin = _vm.GetOutputPinValue(pdmOutput.Id);
-            _savedOut2Pin = _vm.GetOutputPinValue(out2Row.output.Id);
-
-            var redirectStatus = await Task.Run(() => _vm.SetOutputPinValue(out2Row.output.Id, pdmPin));
-            if (redirectStatus == PinConfigResult.Success)
-            {
-                _suppressSelectionChanged = true;
-                var gpioIdx = Array.IndexOf(ValidPins, pdmPin);
-                if (gpioIdx >= 0) out2Row.gpioPicker.SelectedIndex = gpioIdx;
-                _suppressSelectionChanged = false;
-                UpdateBadgeVisibility(out2Row.badge, pdmPin, out2Row.output.DefaultPin);
-                RefreshAllConflicts();
-                ShowStatus($"SUB OUT → S/PDIF (OUT 3/4 on GPIO {pdmPin})", isError: false);
-            }
-            else
-            {
-                _suppressSelectionChanged = true;
-                combo.SelectedIndex = 0;
-                _suppressSelectionChanged = false;
-                ShowStatus(GetErrorMessage(redirectStatus, pdmOutput.Name), isError: true);
-            }
+            // Firmware doesn't support slot 2 (stock RP2040).
+            // Show error message - user needs either spdif-sub firmware or matrix mixer workaround.
+            _suppressSelectionChanged = true;
+            combo.SelectedIndex = 0; // Revert to PDM
+            _suppressSelectionChanged = false;
+            
+            string errorMsg = (status == PinConfigResult.PinInUse || status == PinConfigResult.InvalidOutput)
+                ? "S/PDIF on SUB OUT requires spdif-sub firmware. Use Matrix Mixer to route sub audio instead."
+                : GetErrorMessage(status, pdmOutput.Name);
+            
+            ShowStatus(errorMsg, isError: true);
         }
         else // PDM selected
         {
-            // If slot 2 was set directly, revert it.
-            if (_savedOut2Pin == 0)
-            {
-                const int PdmSlot = 2;
-                await Task.Run(() => _vm.SetOutputSlotType(PdmSlot, OutputSlotType.Pdm));
-                ShowStatus($"{pdmOutput.Name} → PDM", isError: false);
-                return;
-            }
-
-            // Otherwise restore OUT 3/4 redirect.
-            var out2Row = _outputRows.FirstOrDefault(r => r.output.Id == 1);
-            if (out2Row != default && _savedOut2Pin != 0)
-            {
-                var status = await Task.Run(() => _vm.SetOutputPinValue(out2Row.output.Id, _savedOut2Pin));
-                if (status == PinConfigResult.Success)
-                {
-                    _suppressSelectionChanged = true;
-                    var gpioIdx = Array.IndexOf(ValidPins, _savedOut2Pin);
-                    if (gpioIdx >= 0) out2Row.gpioPicker.SelectedIndex = gpioIdx;
-                    _suppressSelectionChanged = false;
-                    UpdateBadgeVisibility(out2Row.badge, _savedOut2Pin, out2Row.output.DefaultPin);
-                    RefreshAllConflicts();
-                }
-                _savedOut2Pin = 0;
-            }
+            // Switch SUB OUT back to PDM on slot 2 (if previously changed).
+            const int SubSlot = 2;
+            await Task.Run(() => _vm.SetOutputSlotType(SubSlot, OutputSlotType.Pdm));
             ShowStatus($"{pdmOutput.Name} → PDM", isError: false);
         }
     }

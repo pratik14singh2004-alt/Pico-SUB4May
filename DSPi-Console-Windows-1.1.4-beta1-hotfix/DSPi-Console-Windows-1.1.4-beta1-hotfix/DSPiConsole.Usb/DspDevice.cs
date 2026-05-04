@@ -686,10 +686,18 @@ public partial class DspDevice : ObservableObject, IDisposable
         int numCh = NumChannels;
         int peakBytes = numCh * 2;
 
+        // RP2040 sends 7 peaks in sequential channel order but skips the
+        // SPDIF3/4 slots (ChannelIds 6-9), so PDM arrives at firmware position 6
+        // while its ChannelId is 10. Map sequential positions to ChannelId indices.
+        int[] peakMap = numCh == 7
+            ? new[] { 0, 1, 2, 3, 4, 5, 10 }   // RP2040: pos 6 = PDM (ChannelId 10)
+            : new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }; // RP2350: identity
+
         var peaks = new float[11]; // Always 11 slots (max channels)
         for (int i = 0; i < numCh && (i * 2 + 1) < buffer.Length; i++)
         {
-            peaks[i] = BitConverter.ToUInt16(buffer, i * 2) / 32767.0f;
+            int idx = i < peakMap.Length ? peakMap[i] : i;
+            peaks[idx] = BitConverter.ToUInt16(buffer, i * 2) / 32767.0f;
         }
 
         int cpuOffset = peakBytes;

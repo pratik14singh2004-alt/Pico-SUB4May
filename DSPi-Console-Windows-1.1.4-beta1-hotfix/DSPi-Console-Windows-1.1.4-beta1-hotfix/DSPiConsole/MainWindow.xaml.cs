@@ -1,0 +1,4224 @@
+using System.Globalization;
+using System.Linq;
+using DSPiConsole.Controls;
+using DSPiConsole.Core.Models;
+using DSPiConsole.Models;
+using DSPiConsole.Dialogs;
+using DSPiConsole.Services;
+using DSPiConsole.Usb;
+using DSPiConsole.ViewModels;
+using Microsoft.UI;
+using Microsoft.UI.Composition.SystemBackdrops;
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
+using Microsoft.UI.Xaml.Input;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
+using Microsoft.UI.Xaml.Shapes;
+using Windows.Storage.Pickers;
+using Windows.UI;
+using WinRT.Interop;
+using WinRT;
+using System.Runtime.InteropServices;
+
+namespace DSPiConsole;
+
+public sealed partial class MainWindow : Window
+{
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    public MainViewModel ViewModel { get; }
+    public IReadOnlyList<Channel> InputChannels => Channel.Inputs;
+    public IReadOnlyList<Channel> OutputChannels => Channel.Outputs;
+
+    private Channel? _selectedChannel;
+    private Slider? _inputPreampSlider;
+    private TextBlock? _inputPreampValueText;
+    private bool _isScrollAdjusting;
+    private DateTime _lastFilterScrollTime = DateTime.MinValue;
+    private bool _isUpdatingDelay;
+    private bool _isUpdatingGain;
+    private bool _closeConfirmed;
+    private StatsWindow? _statsWindow;
+    private GraphWindow? _graphWindow;
+    private LoudnessWindow? _loudnessWindow;
+    private CrossfeedWindow? _crossfeedWindow;
+    private VolumeLevellerWindow? _levellerWindow;
+    private MatrixMixerWindow? _matrixMixerWindow;
+
+    // Track output controls for live updates
+    private TextBox? _currentGainTextBox;
+    private TextBox? _currentDelayTextBox;
+    private Slider? _currentGainSlider;
+    private Slider? _currentDelaySlider;
+    private TextBlock? _currentDelayUnitText;
+
+    // Route indicator controls for current output channel
+    private readonly Dictionary<int, Border> _currentRouteCircles = new();
+    private readonly Dictionary<int, TextBlock> _currentRouteNameTexts = new();
+    private readonly Dictionary<int, TextBox> _currentRouteGainTexts = new();
+    private readonly Dictionary<int, TextBlock> _currentRouteInvTexts = new();
+    private int _currentOutputIndex = -1;
+
+    // Graph resize state
+    private const double GraphMinHeight = 250;
+    private const double GraphMaxHeight = 350;
+    private bool _isResizingGraph;
+    private double _graphResizeStartY;
+    private double _graphResizeStartHeight;
+
+    // Simple channel selection: 0 = dashboard, 1-5 = channel index
+    private int _selectedChannelIndex = 0;
+    private readonly List<ListViewItem> _channelListItems = new();
+    private readonly Dictionary<int, TextBlock> _channelNameTexts = new();
+
+    // Inline per-channel meters: keyed by ChannelId
+    private readonly Dictionary<int, HorizontalMeterBar> _channelMeters = new();
+
+    // Preset combo guard
+    private bool _isUpdatingPresetCombo;
+
+    // Dashboard rebuild debounce
+    private DispatcherTimer? _dashboardDebounce;
+
+    // Dashboard header stats TextBlocks: keyed by channelId
+    private readonly Dictionary<int, TextBlock> _dashboardHeaderStats = new();
+
+    // Pre-built output channel items: keyed by output index
+    private readonly Dictionary<int, ListViewItem> _outputChannelItems = new();
+
+
+    // Acrylic backdrop
+    private DesktopAcrylicController? _acrylicController;
+    private SystemBackdropConfiguration? _configurationSource;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        this.ExtendsContentIntoTitleBar = true;
+
+        SetupAcrylicBackdrop();
+        this.SetTitleBar(AppTitleBar);
+
+        AppTitleBar.SizeChanged += (_, _) => UpdateTitleBarDragRegion();
+        TitleBarMenuButton.SizeChanged += (_, _) => UpdateTitleBarDragRegion();
+
+        ViewModel = new MainViewModel();
+        ViewModel.MasterPeqLinked = AppSettings.Instance.MasterPeqLinked;
+        BodePlot.DataContext = ViewModel;
+        BodePlot.SetDottedInactiveEnabled(AppSettings.Instance.DottedInactiveChannels);
+        BodePlot.SetMasterLinkedGradient(ViewModel.MasterPeqLinked);
+
+        // Set window size (scale for DPI)
+        var appWindow = GetAppWindow();
+        if (appWindow != null)
+        {
+            double dpiScale = GetDpiForWindow(WindowNative.GetWindowHandle(this)) / 96.0;
+            appWindow.Resize(new Windows.Graphics.SizeInt32((int)(1000 * dpiScale), (int)(825 * dpiScale)));
+            appWindow.Title = "DSPi Console";
+            appWindow.Closing += OnAppWindowClosing;
+        }
+
+
+        // Initialize channel lists
+        InitializeChannelLists();
+
+        // Initialize legend
+        InitializeLegend();
+
+        // Initialize dashboard
+        InitializeDashboard();
+
+        // Subscribe to ViewModel events
+        ViewModel.PropertyChanged += OnViewModelPropertyChanged;
+        ViewModel.FiltersChanged += (_, _) =>
+        {
+            BodePlot.Invalidate();
+            ScheduleDashboardRefresh();
+            if (_selectedChannel != null && !_isScrollAdjusting && !_isUpdatingGain && !_isUpdatingDelay)
+                ShowChannelEditor(_selectedChannel);
+        };
+        ViewModel.BypassChanged += (_, _) => BodePlot.Invalidate();
+        AppSettings.Instance.SettingsChanged += (_, _) =>
+        {
+            DispatcherQueue.TryEnqueue(UpdatePresetDirtyIndicator);
+            if (_graphWindow == null) return;
+            bool follows = AppSettings.Instance.PopoutFollowsSelectedChannel;
+            _graphWindow.SetIgnoreVisibility(!follows);
+            if (follows && _selectedChannel != null)
+                _graphWindow.SetSelectedChannel((int)_selectedChannel.Id);
+            else if (!follows)
+                _graphWindow.SetSelectedChannel(-1);
+        };
+        ViewModel.VisibilityChanged += (_, _) =>
+        {
+            UpdateLegend();
+            BodePlot.Invalidate();
+        };
+
+        ViewModel.ChannelNameChanged += channelId =>
+        {
+            if (_channelNameTexts.TryGetValue(channelId, out var tb))
+                tb.Text = ViewModel.GetChannelName(Channel.FromId((ChannelId)channelId));
+        };
+
+        ViewModel.ActiveOutputsChanged += (s, e) =>
+            DispatcherQueue.TryEnqueue(() => { InitializeChannelLists(); InitializeLegend(); });
+
+        ViewModel.OutputEnabledChanged += (outputIndex, enabled) =>
+            DispatcherQueue.TryEnqueue(() => { OnOutputEnabledChanged(outputIndex, enabled); InitializeLegend(); if (DashboardPanel.Visibility == Visibility.Visible) UpdateDashboardCards(); });
+
+        ViewModel.MatrixOutputGainChanged += outputIndex =>
+            DispatcherQueue.TryEnqueue(() => { SyncGainFromViewModel(outputIndex); BodePlot.Invalidate(); });
+
+        ViewModel.MatrixOutputDelayChanged += outputIndex =>
+            DispatcherQueue.TryEnqueue(() => { SyncDelayFromViewModel(outputIndex); BodePlot.Invalidate(); });
+
+        ViewModel.MatrixRouteChanged += (input, output) =>
+            DispatcherQueue.TryEnqueue(() => SyncRouteIndicator(input, output));
+
+        ViewModel.PresetsChanged += (_, _) =>
+            DispatcherQueue.TryEnqueue(RefreshPresetComboBox);
+
+        ViewModel.InputSourceChanged += (_, _) =>
+            DispatcherQueue.TryEnqueue(RefreshSourceComboBox);
+
+        // Right-click context menu on preset combo
+        PresetComboBox.RightTapped += OnPresetComboRightTapped;
+
+
+        // Right-click preamp slider to reset to 0 dB
+        MasterVolumeSlider.RightTapped += (s, e) =>
+        {
+            e.Handled = true;
+            ViewModel.MasterVolumeDb = ViewModel.SavedSnapshot?.MasterVolumeDb ?? 0f;
+        };
+
+        // Multi-device: register unsaved changes dialog
+        ViewModel.ShowUnsavedChangesDialog = ShowUnsavedChangesDialogAsync;
+        ViewModel.PromptForPresetName = PromptForPresetNameAsync;
+
+        // Multi-device: update device selector when available devices change
+        ViewModel.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == nameof(MainViewModel.AvailableDevices) ||
+                e.PropertyName == nameof(MainViewModel.SelectedDeviceItem))
+            {
+                DispatcherQueue.TryEnqueue(UpdateDeviceSelector);
+            }
+            else if (e.PropertyName == nameof(MainViewModel.ActivePreset))
+            {
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    UpdateActivePresetSelection();
+                    UpdatePresetDirtyIndicator();
+                    UpdateWindowTitle();
+                });
+            }
+            else if (e.PropertyName == nameof(MainViewModel.PresetsDirty))
+            {
+                DispatcherQueue.TryEnqueue(() =>
+                {
+                    UpdatePresetDirtyIndicator();
+                    UpdateWindowTitle();
+                });
+            }
+        };
+        ViewModel.AvailableDevices.CollectionChanged += (s, e) =>
+            DispatcherQueue.TryEnqueue(UpdateDeviceSelector);
+
+        // Initial UI state
+        UpdateConnectionStatus();
+        UpdateMasterVolumeDisplay();
+        UpdateBypassButton();
+
+        // Initialize AutoEQ (load database in background)
+        _ = InitializeAutoEQAsync();
+    }
+
+    private async Task InitializeAutoEQAsync()
+    {
+        await AutoEQManager.Instance.LoadDatabaseAsync();
+        DispatcherQueue.TryEnqueue(RefreshAutoEQFavoritesMenu);
+    }
+
+    private AppWindow? GetAppWindow()
+    {
+        var hWnd = WindowNative.GetWindowHandle(this);
+        var windowId = Win32Interop.GetWindowIdFromWindow(hWnd);
+        return AppWindow.GetFromWindowId(windowId);
+    }
+
+    private void SetupAcrylicBackdrop()
+    {
+        if (!DesktopAcrylicController.IsSupported())
+            return;
+
+        _configurationSource = new SystemBackdropConfiguration
+        {
+            IsInputActive = true  // Always keep translucency visible, even when unfocused
+        };
+        this.Closed += (s, e) =>
+        {
+            _acrylicController?.Dispose();
+            _acrylicController = null;
+            _configurationSource = null;
+        };
+
+        // Sidebar and titlebar translucency settings
+        _acrylicController = new DesktopAcrylicController
+        {
+            TintColor = Windows.UI.Color.FromArgb(255, 32, 32, 32),
+            TintOpacity = 0.5f,
+            LuminosityOpacity = 0.8f
+        };
+
+        _acrylicController.AddSystemBackdropTarget(this.As<Microsoft.UI.Composition.ICompositionSupportsSystemBackdrop>());
+        _acrylicController.SetSystemBackdropConfiguration(_configurationSource);
+    }
+
+    private void InitializeChannelLists()
+    {
+        // Build channel list items programmatically
+        // Index 0 = dashboard (no item), 1+ = channels
+        _channelListItems.Clear();
+        _outputChannelItems.Clear();
+        _channelMeters.Clear();
+
+        InputChannelsList.Items.Clear();
+        OutputChannelsList.Items.Clear();
+
+        if (!ViewModel.IsDeviceConnected) return;
+
+        int index = 1;
+        foreach (var channel in Channel.Inputs)
+        {
+            var item = CreateChannelListItem(channel, index++);
+            _channelListItems.Add(item);
+            InputChannelsList.Items.Add(item);
+        }
+
+        // Pre-build all output items and add enabled ones
+        for (int o = 0; o < ViewModel.ActiveOutputs.Count; o++)
+        {
+            var channel = ViewModel.ActiveOutputs[o];
+            var item = CreateChannelListItem(channel, index);
+            _outputChannelItems[o] = item;
+            if (ViewModel.IsOutputEnabled(o))
+            {
+                item.Tag = (channel, index++);
+                _channelListItems.Add(item);
+                OutputChannelsList.Items.Add(item);
+            }
+        }
+    }
+
+    private void OnOutputEnabledChanged(int outputIndex, bool enabled)
+    {
+        if (!_outputChannelItems.TryGetValue(outputIndex, out var item)) return;
+
+        if (enabled)
+        {
+            if (OutputChannelsList.Items.Contains(item)) return;
+            // Insert at the correct position to maintain output order
+            int insertAt = 0;
+            for (int o = 0; o < outputIndex; o++)
+            {
+                if (ViewModel.IsOutputEnabled(o) && OutputChannelsList.Items.Contains(_outputChannelItems[o]))
+                    insertAt++;
+            }
+            OutputChannelsList.Items.Insert(insertAt, item);
+        }
+        else
+        {
+            OutputChannelsList.Items.Remove(item);
+        }
+
+        // Re-index the flat list for selection tracking
+        int inputCount = Channel.Inputs.Count;
+        if (_channelListItems.Count > inputCount)
+            _channelListItems.RemoveRange(inputCount, _channelListItems.Count - inputCount);
+
+        int index = inputCount + 1;
+        for (int o = 0; o < ViewModel.ActiveOutputs.Count; o++)
+        {
+            if (!ViewModel.IsOutputEnabled(o) || !_outputChannelItems.TryGetValue(o, out var outItem)) continue;
+            outItem.Tag = (ViewModel.ActiveOutputs[o], index++);
+            _channelListItems.Add(outItem);
+        }
+
+        UpdateChannelListSelection();
+    }
+
+    private ListViewItem CreateChannelListItem(Channel channel, int index)
+    {
+        // Store both channel and index in Tag
+        var item = new ListViewItem
+        {
+            Tag = (channel, index),
+            HorizontalContentAlignment = HorizontalAlignment.Stretch
+        };
+        item.Tapped += OnChannelItemTapped;
+
+        // When linked, hovering one master channel highlights both
+        if (channel.Id == ChannelId.MasterLeft || channel.Id == ChannelId.MasterRight)
+        {
+            item.PointerEntered += OnMasterItemPointerEntered;
+            item.PointerExited += OnMasterItemPointerExited;
+        }
+
+        var grid = new Grid { Height = 32, HorizontalAlignment = HorizontalAlignment.Stretch };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(74, GridUnitType.Pixel) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var nameText = new TextBlock
+        {
+            Text = ViewModel.GetChannelName(channel),
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+        };
+        var nameBox = new TextBox
+        {
+            Text = ViewModel.GetChannelName(channel),
+            VerticalAlignment = VerticalAlignment.Center,
+            Visibility = Visibility.Collapsed,
+            Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"],
+            Style = (Style)RootGrid.Resources["ChannelNameTextBoxStyle"]
+        };
+        var nameContainer = new Grid();
+        nameContainer.Children.Add(nameText);
+        nameContainer.Children.Add(nameBox);
+        _channelNameTexts[(int)channel.Id] = nameText;
+        Grid.SetColumn(nameContainer, 0);
+        grid.Children.Add(nameContainer);
+
+        void CommitSidebarName()
+        {
+            if (nameBox.Visibility != Visibility.Visible) return;
+            nameBox.Visibility = Visibility.Collapsed;
+            nameText.Visibility = Visibility.Visible;
+            var name = nameBox.Text.Trim();
+            if (!string.IsNullOrEmpty(name)) ViewModel.SetChannelName(channel, name);
+            FocusSink.Focus(FocusState.Programmatic);
+        }
+
+        var flyout = new MenuFlyout();
+
+        var copyItem = new MenuFlyoutItem { Text = "Copy Parameters" };
+        copyItem.Click += (s, e) => ViewModel.CopyChannelParams(channel);
+
+        var pasteItem = new MenuFlyoutItem { Text = "Paste Parameters" };
+        pasteItem.Click += (s, e) =>
+        {
+            ViewModel.PasteChannelParams(channel);
+            if (_selectedChannel == channel)
+                ShowChannelEditor(channel);
+        };
+
+        var renameItem = new MenuFlyoutItem { Text = "Rename" };
+        renameItem.Click += (s, e) =>
+        {
+            nameText.Visibility = Visibility.Collapsed;
+            nameBox.Text = ViewModel.GetChannelName(channel);
+            nameBox.Visibility = Visibility.Visible;
+            nameBox.Focus(FocusState.Programmatic);
+            nameBox.SelectAll();
+        };
+
+        flyout.Opening += (s, e) =>
+        {
+            pasteItem.IsEnabled = ViewModel.HasChannelClipboard;
+        };
+
+        flyout.Items.Add(copyItem);
+        flyout.Items.Add(pasteItem);
+        flyout.Items.Add(new MenuFlyoutSeparator());
+        flyout.Items.Add(renameItem);
+
+        item.ContextFlyout = flyout;
+
+        nameBox.KeyDown += (s, e) =>
+        {
+            if (e.Key == Windows.System.VirtualKey.Enter) { e.Handled = true; CommitSidebarName(); }
+            else if (e.Key == Windows.System.VirtualKey.Escape)
+            {
+                nameBox.Visibility = Visibility.Collapsed;
+                nameText.Visibility = Visibility.Visible;
+                FocusSink.Focus(FocusState.Programmatic);
+            }
+        };
+        nameBox.LostFocus += (s, e) => CommitSidebarName();
+
+        // Modern pill-shaped badge with glow indicator
+        var badge = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(15, channel.Color.R, channel.Color.G, channel.Color.B)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(80, channel.Color.R, channel.Color.G, channel.Color.B)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(7, 2, 7, 2),
+            MinWidth = 46,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var badgeContent = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 6,
+            HorizontalAlignment = HorizontalAlignment.Center
+        };
+
+        // Glowing indicator dot with layered effect
+        var dotContainer = new Grid
+        {
+            Width = 8,
+            Height = 8,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        // Outer glow
+        var dotGlow = new Ellipse
+        {
+            Width = 8,
+            Height = 8,
+            Fill = new SolidColorBrush(Color.FromArgb(100, channel.Color.R, channel.Color.G, channel.Color.B))
+        };
+        dotContainer.Children.Add(dotGlow);
+
+        // Inner bright dot
+        var dotCore = new Ellipse
+        {
+            Width = 5,
+            Height = 5,
+            Fill = new SolidColorBrush(channel.Color),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        //dotContainer.Children.Add(dotCore);
+
+        //badgeContent.Children.Add(dotContainer);
+
+        var badgeText = new TextBlock
+        {
+            Text = channel.Descriptor,
+            FontSize = 9,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            Foreground = new SolidColorBrush(Color.FromArgb(230, channel.Color.R, channel.Color.G, channel.Color.B)),
+            VerticalAlignment = VerticalAlignment.Center,
+            CharacterSpacing = 80
+        };
+        badgeContent.Children.Add(badgeText);
+
+        badge.Child = badgeContent;
+        Grid.SetColumn(badge, 2);
+        grid.Children.Add(badge);
+
+        // Inline meter bar
+        var meter = new HorizontalMeterBar
+        {
+            MeterColor = channel.Color,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(4, 0, 12, 0)
+        };
+        Grid.SetColumn(meter, 1);
+        grid.Children.Add(meter);
+        _channelMeters[(int)channel.Id] = meter;
+
+        item.Content = grid;
+        return item;
+    }
+
+    private void InitializeLegend()
+    {
+        LegendPanel.Children.Clear();
+
+        // Input channels are always shown
+        foreach (var channel in Channel.Inputs)
+            AddLegendButton(channel);
+
+        // Only show enabled output channels
+        for (int o = 0; o < ViewModel.ActiveOutputs.Count; o++)
+        {
+            if (!ViewModel.IsOutputEnabled(o)) continue;
+            AddLegendButton(ViewModel.ActiveOutputs[o]);
+        }
+
+        UpdateLegend();
+    }
+
+    private void AddLegendButton(Channel channel)
+    {
+        var btn = new Button
+        {
+            Tag = channel,
+            Padding = new Thickness(8, 4, 8, 4),
+            Background = new SolidColorBrush(Colors.Transparent),
+            BorderThickness = new Thickness(0)
+        };
+
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+
+        var indicator = new Ellipse
+        {
+            Width = 6,
+            Height = 6,
+            Fill = new SolidColorBrush(channel.Color)
+        };
+
+        var label = new TextBlock
+        {
+            Text = channel.Descriptor,
+            FontSize = 10,
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+            Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+        };
+
+        panel.Children.Add(indicator);
+        panel.Children.Add(label);
+        btn.Content = panel;
+
+        btn.Click += (s, e) =>
+        {
+            if (s is Button b && b.Tag is Channel ch)
+            {
+                ViewModel.ToggleChannelVisibility(ch);
+            }
+        };
+
+        LegendPanel.Children.Add(btn);
+    }
+
+    private void UpdateLegend()
+    {
+        foreach (var child in LegendPanel.Children)
+        {
+            if (child is Button btn && btn.Tag is Channel channel)
+            {
+                bool isVisible = ViewModel.GetChannelVisibility(channel);
+                var panel = btn.Content as StackPanel;
+                if (panel != null)
+                {
+                    var ellipse = panel.Children[0] as Ellipse;
+                    var text = panel.Children[1] as TextBlock;
+
+                    if (ellipse != null)
+                    {
+                        ellipse.Fill = new SolidColorBrush(isVisible ? channel.Color : Colors.Gray);
+                        ellipse.Opacity = isVisible ? 1.0 : 0.5;
+                    }
+
+                    if (text != null)
+                    {
+                        text.Opacity = isVisible ? 1.0 : 0.5;
+                    }
+                }
+
+                btn.Background = new SolidColorBrush(
+                    isVisible ? Color.FromArgb(38, channel.Color.R, channel.Color.G, channel.Color.B) : Colors.Transparent);
+            }
+        }
+    }
+
+    private void ScheduleDashboardRefresh()
+    {
+        if (DashboardPanel.Visibility != Visibility.Visible) return;
+        _dashboardDebounce?.Stop();
+        _dashboardDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        _dashboardDebounce.Tick += (s, e) =>
+        {
+            _dashboardDebounce!.Stop();
+            InitializeDashboard();
+        };
+        _dashboardDebounce.Start();
+    }
+
+    private void InitializeDashboard()
+    {
+        _dashboardHeaderStats.Clear();
+
+        var savedTransitions = DashboardPanel.ChildrenTransitions;
+        DashboardPanel.ChildrenTransitions = new Microsoft.UI.Xaml.Media.Animation.TransitionCollection();
+
+        DashboardPanel.Children.Clear();
+
+        if (!ViewModel.IsDeviceConnected)
+        {
+            DashboardPanel.ChildrenTransitions = savedTransitions;
+            return;
+        }
+
+        foreach (var (key, card) in BuildDashboardCards())
+        {
+            card.Tag = key;
+            DashboardPanel.Children.Add(card);
+        }
+
+        DashboardPanel.ChildrenTransitions = savedTransitions;
+    }
+
+    private void UpdateDashboardCards()
+    {
+        if (!ViewModel.IsDeviceConnected) return;
+
+        _dashboardHeaderStats.Clear();
+        var desired = BuildDashboardCards();
+        var desiredKeys = desired.Select(d => d.key).ToList();
+
+        // Remove cards that should no longer exist
+        for (int i = DashboardPanel.Children.Count - 1; i >= 0; i--)
+        {
+            var key = ((FrameworkElement)DashboardPanel.Children[i]).Tag as string;
+            if (key == null || !desiredKeys.Contains(key))
+                DashboardPanel.Children.RemoveAt(i);
+        }
+
+        // Get current keys after removal
+        var currentKeys = DashboardPanel.Children
+            .Cast<FrameworkElement>()
+            .Select(c => c.Tag as string)
+            .ToList();
+
+        // Add missing cards at correct positions
+        for (int i = 0; i < desired.Count; i++)
+        {
+            var (key, card) = desired[i];
+            if (!currentKeys.Contains(key))
+            {
+                card.Tag = key;
+                DashboardPanel.Children.Insert(Math.Min(i, DashboardPanel.Children.Count), card);
+                currentKeys.Insert(Math.Min(i, currentKeys.Count), key);
+            }
+        }
+    }
+
+    private List<(string key, FrameworkElement card)> BuildDashboardCards()
+    {
+        var cards = new List<(string key, FrameworkElement card)>();
+
+        // Stereo Input Card (always shown when connected)
+        cards.Add(("input", CreateStereoDashboardCard("STEREO INPUT (USB)", Channel.MasterLeft, Channel.MasterRight, false)));
+
+        // Build output cards for enabled channels, pairing stereo L/R
+        var outputs = ViewModel.ActiveOutputs;
+        var processed = new HashSet<int>();
+
+        for (int o = 0; o < outputs.Count; o++)
+        {
+            if (!ViewModel.IsOutputEnabled(o) || processed.Contains(o)) continue;
+
+            var ch = outputs[o];
+
+            // Check for stereo pair: consecutive L/R channels with adjacent IDs
+            int pairIndex = -1;
+            if (o + 1 < outputs.Count && (int)outputs[o + 1].Id == (int)ch.Id + 1 && ViewModel.IsOutputEnabled(o + 1))
+                pairIndex = o + 1;
+
+            if (pairIndex >= 0)
+            {
+                var left = ch;
+                var right = outputs[pairIndex];
+                cards.Add(($"{left.ShortName}-{right.ShortName}", CreateStereoDashboardCard($"{left.Name} / {right.Name}", left, right, true)));
+                processed.Add(o);
+                processed.Add(pairIndex);
+            }
+            else
+            {
+                cards.Add((ch.ShortName, CreateMonoDashboardCard(ch)));
+                processed.Add(o);
+            }
+        }
+
+        return cards;
+    }
+
+    // Horizontal gradient brush used for dashboard card outlines: leftColor on
+    // the left edge, rightColor on the right. For mono cards both args are the
+    // same color, which renders as a solid outline.
+    private static LinearGradientBrush CreateChannelGradientBrush(Color leftColor, Color rightColor)
+    {
+        const byte alpha = 102;
+        var brush = new LinearGradientBrush
+        {
+            StartPoint = new Windows.Foundation.Point(0, 0.5),
+            EndPoint = new Windows.Foundation.Point(1, 0.5)
+        };
+        brush.GradientStops.Add(new GradientStop
+        {
+            Offset = 0,
+            Color = Color.FromArgb(alpha, leftColor.R, leftColor.G, leftColor.B)
+        });
+        brush.GradientStops.Add(new GradientStop
+        {
+            Offset = 1,
+            Color = Color.FromArgb(alpha, rightColor.R, rightColor.G, rightColor.B)
+        });
+        return brush;
+    }
+
+    private Border CreateStereoDashboardCard(string title, Channel left, Channel right, bool showDelay)
+    {
+        var card = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(178, 36, 36, 36)),
+            CornerRadius = new CornerRadius(8),
+            BorderBrush = CreateChannelGradientBrush(left.Color, right.Color),
+            BorderThickness = new Thickness(1)
+        };
+
+        var mainStack = new StackPanel();
+
+        // Header row
+        var headerGrid = new Grid();
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        headerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        headerGrid.Children.Add(CreateChannelHeader(left, showDelay, 0));
+        headerGrid.Children.Add(CreateChannelHeader(right, showDelay, 1));
+
+        mainStack.Children.Add(headerGrid);
+        mainStack.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromArgb(51, 128, 128, 128)) });
+
+        // Filter rows
+        var contentGrid = new Grid();
+        contentGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        contentGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1) });
+        contentGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var leftFilters = CreateDashboardFilterList(left);
+        Grid.SetColumn(leftFilters, 0);
+        contentGrid.Children.Add(leftFilters);
+
+        var divider = new Border { Background = new SolidColorBrush(Color.FromArgb(51, 128, 128, 128)) };
+        Grid.SetColumn(divider, 1);
+        contentGrid.Children.Add(divider);
+
+        var rightFilters = CreateDashboardFilterList(right);
+        Grid.SetColumn(rightFilters, 2);
+        contentGrid.Children.Add(rightFilters);
+
+        mainStack.Children.Add(contentGrid);
+        card.Child = mainStack;
+
+        return card;
+    }
+
+    private Border CreateChannelHeader(Channel channel, bool showDelay, int column)
+    {
+        var header = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(102, 38, 38, 38)),
+            Padding = new Thickness(8)
+        };
+        Grid.SetColumn(header, column);
+
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+
+        panel.Children.Add(new Ellipse
+        {
+            Width = 6,
+            Height = 6,
+            Fill = new SolidColorBrush(channel.Color)
+        });
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = channel.Name,
+            FontSize = 11,
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+            Foreground = new SolidColorBrush(Color.FromArgb(
+                255,
+                (byte)(channel.Color.R * 0.7),
+                (byte)(channel.Color.G * 0.7),
+                (byte)(channel.Color.B * 0.7)))
+        });
+
+        if (showDelay)
+        {
+            var gain = ViewModel.GetChannelGain(channel);
+            var isMuted = ViewModel.GetChannelMute(channel);
+
+            var statsText = new TextBlock
+            {
+                Text = $"{gain:F1}dB  {ViewModel.GetChannelDelay(channel):F0}ms{(isMuted ? "  MUTED" : "")}",
+                FontSize = 9,
+                FontFamily = new FontFamily("Cascadia Code, Consolas"),
+                Foreground = new SolidColorBrush(isMuted ? Color.FromArgb(255, 200, 80, 80) : Colors.Gray),
+                Margin = new Thickness(8, 0, 0, 0)
+            };
+            _dashboardHeaderStats[(int)channel.Id] = statsText;
+            panel.Children.Add(statsText);
+        }
+
+        header.Child = panel;
+        return header;
+    }
+
+    private StackPanel CreateDashboardFilterList(Channel channel)
+    {
+        var stack = new StackPanel();
+        var filters = ViewModel.GetFilters(channel);
+
+        for (int i = 0; i < filters.Count; i++)
+        {
+            var row = CreateDashboardFilterRow(i + 1, filters[i], channel.Color);
+            row.Background = new SolidColorBrush(i % 2 == 0 ? Color.FromArgb(40, 0, 0, 0) : Colors.Transparent);
+            stack.Children.Add(row);
+        }
+
+        return stack;
+    }
+
+    private Grid CreateDashboardFilterRow(int band, FilterParams p, Color color)
+    {
+        var grid = new Grid { Height = 24, Padding = new Thickness(8, 0, 8, 0), ColumnSpacing = 4 };
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(20) });  // 0: Band #
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(32) });  // 1: Type
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // 2: Spacer
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(52) });  // 3: Freq
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(54) });  // 4: Gain
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(52) });  // 5: Q
+
+        bool isActive = p.Type != FilterType.Flat;
+
+        var bandText = new TextBlock
+        {
+            Text = band.ToString(),
+            FontSize = 10,
+            FontFamily = new FontFamily("Cascadia Code"),
+            Foreground = new SolidColorBrush(Color.FromArgb(178, 128, 128, 128)),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(bandText, 0);
+        grid.Children.Add(bandText);
+
+        var typeText = new TextBlock
+        {
+            Text = p.Type.GetShortName(),
+            FontSize = 10,
+            FontWeight = Microsoft.UI.Text.FontWeights.Bold,
+            Foreground = new SolidColorBrush(isActive
+                ? Color.FromArgb(255, (byte)(color.R * 0.7), (byte)(color.G * 0.7), (byte)(color.B * 0.7))
+                : Color.FromArgb(102, 128, 128, 128)),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(typeText, 1);
+        grid.Children.Add(typeText);
+
+        if (isActive)
+        {
+            var secondaryBrush = (SolidColorBrush)Application.Current.Resources["TextFillColorSecondaryBrush"];
+            var tertiaryBrush = (SolidColorBrush)Application.Current.Resources["TextFillColorTertiaryBrush"];
+
+            var freqPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, HorizontalAlignment = HorizontalAlignment.Right };
+            freqPanel.Children.Add(new TextBlock
+            {
+                Text = $"{p.Frequency:F0}",
+                FontSize = 10,
+                FontFamily = new FontFamily("Cascadia Code"),
+                Foreground = secondaryBrush,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            freqPanel.Children.Add(new TextBlock
+            {
+                Text = "Hz",
+                FontSize = 8,
+                Foreground = tertiaryBrush,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            Grid.SetColumn(freqPanel, 3);
+            grid.Children.Add(freqPanel);
+
+            if (p.Type.HasGain())
+            {
+                var gainPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, HorizontalAlignment = HorizontalAlignment.Right };
+                gainPanel.Children.Add(new TextBlock
+                {
+                    Text = FormatFilterValueSigned(p.Gain),
+                    FontSize = 10,
+                    FontFamily = new FontFamily("Cascadia Code"),
+                    Foreground = secondaryBrush,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                gainPanel.Children.Add(new TextBlock
+                {
+                    Text = "dB",
+                    FontSize = 8,
+                    Foreground = tertiaryBrush,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                Grid.SetColumn(gainPanel, 4);
+                grid.Children.Add(gainPanel);
+            }
+
+            if (p.Type.HasQ())
+            {
+                var qPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, HorizontalAlignment = HorizontalAlignment.Right };
+                qPanel.Children.Add(new TextBlock
+                {
+                    Text = FormatFilterValue(p.Q, 3),
+                    FontSize = 10,
+                    FontFamily = new FontFamily("Cascadia Code"),
+                    Foreground = secondaryBrush,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                qPanel.Children.Add(new TextBlock
+                {
+                    Text = "Q",
+                    FontSize = 8,
+                    Foreground = tertiaryBrush,
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                Grid.SetColumn(qPanel, 5);
+                grid.Children.Add(qPanel);
+            }
+        }
+        else
+        {
+            var dash = new TextBlock
+            {
+                Text = "—",
+                FontSize = 10,
+                Foreground = new SolidColorBrush(Color.FromArgb(51, 128, 128, 128)),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            Grid.SetColumn(dash, 3);
+            grid.Children.Add(dash);
+        }
+
+        return grid;
+    }
+
+    private Border CreateMonoDashboardCard(Channel channel)
+    {
+        var card = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(178, 36, 36, 36)),
+            CornerRadius = new CornerRadius(8),
+            BorderBrush = CreateChannelGradientBrush(channel.Color, channel.Color),
+            BorderThickness = new Thickness(1)
+        };
+
+        var stack = new StackPanel();
+        stack.Children.Add(CreateChannelHeader(channel, true, 0));
+        stack.Children.Add(new Border { Height = 1, Background = new SolidColorBrush(Color.FromArgb(51, channel.Color.R, channel.Color.G, channel.Color.B)) });
+        stack.Children.Add(CreateDashboardFilterList(channel));
+
+        card.Child = stack;
+        return card;
+    }
+
+    private void ShowChannelEditor(Channel channel)
+    {
+        _selectedChannel = channel;
+
+        // Set gradient flag before SetSelectedChannel to avoid a redraw without it
+        bool linkedMaster = ViewModel.MasterPeqLinked &&
+            (channel.Id == ChannelId.MasterLeft || channel.Id == ChannelId.MasterRight);
+        BodePlot.SetMasterLinkedGradient(linkedMaster);
+
+        BodePlot.SetSelectedChannel((int)channel.Id);
+        if (AppSettings.Instance.PopoutFollowsSelectedChannel)
+            _graphWindow?.SetSelectedChannel((int)channel.Id);
+
+        DashboardPanel.Visibility = Visibility.Collapsed;
+        ChannelEditorPanel.Visibility = Visibility.Visible;
+
+        ChannelEditorPanel.Children.Clear();
+        _inputPreampSlider = null;
+        _inputPreampValueText = null;
+
+        if (channel.Id == ChannelId.MasterLeft || channel.Id == ChannelId.MasterRight)
+        {
+            bool isLeft = channel.Id == ChannelId.MasterLeft;
+
+            var headerRow = new Grid();
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            headerRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var linkBtn = new ToggleButton
+            {
+                Content = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 6,
+                    Children =
+                    {
+                        new FontIcon { Glyph = "\uE71B", FontSize = 14, Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] },
+                        new TextBlock { Text = "Link L/R", FontSize = 12, Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] }
+                    }
+                },
+                IsChecked = ViewModel.MasterPeqLinked,
+                Height = 32,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            // Replace the default (blinding) accent fill on the checked state
+            // with the tertiary accent brush, which is derived from the system
+            // accent color but with lower intensity so it updates automatically
+            // when the user changes their system accent.
+            linkBtn.Resources["ToggleButtonBackgroundChecked"] = (Brush)Application.Current.Resources["AccentFillColorTertiaryBrush"];
+            linkBtn.Resources["ToggleButtonBackgroundCheckedPointerOver"] = (Brush)Application.Current.Resources["AccentFillColorSecondaryBrush"];
+            linkBtn.Resources["ToggleButtonBackgroundCheckedPressed"] = (Brush)Application.Current.Resources["AccentFillColorTertiaryBrush"];
+            linkBtn.Resources["ToggleButtonForegroundChecked"] = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+            linkBtn.Resources["ToggleButtonForegroundCheckedPointerOver"] = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+            linkBtn.Resources["ToggleButtonForegroundCheckedPressed"] = (Brush)Application.Current.Resources["TextFillColorPrimaryBrush"];
+            linkBtn.Click += async (s, e) =>
+            {
+                bool wantLink = linkBtn.IsChecked == true;
+
+                // When enabling and the two master channels' filters disagree,
+                // ask the user which channel's bank should win — silently
+                // overwriting one would lose work the user might still want.
+                int sourceChannel = (int)channel.Id;
+                if (wantLink && ViewModel.MasterFiltersDiffer())
+                {
+                    var chosen = await AskWhichMasterFiltersToKeep();
+                    if (chosen == null)
+                    {
+                        // Cancelled: revert toggle visual state, keep link off.
+                        linkBtn.IsChecked = false;
+                        return;
+                    }
+                    sourceChannel = chosen.Value;
+                }
+
+                // Commit the link state BEFORE the sync. SyncMasterFilters
+                // fires FiltersChanged, which causes MainWindow to rebuild
+                // the channel editor — and the rebuild reads
+                // ViewModel.MasterPeqLinked to set the new link button's
+                // IsChecked. If we set it after, the rebuilt button is born
+                // unchecked and only illuminates next time you re-enter the
+                // editor. On a sync failure we revert below.
+                ViewModel.MasterPeqLinked = wantLink;
+                AppSettings.Instance.MasterPeqLinked = ViewModel.MasterPeqLinked;
+                AppSettings.Instance.Save();
+
+                if (wantLink)
+                {
+                    var ok = await ViewModel.SyncMasterFilters(sourceChannel);
+                    if (!ok)
+                    {
+                        // Revert the link state and rebuild the editor so the
+                        // (now stale, off-screen) link button is replaced with
+                        // a fresh unchecked one.
+                        ViewModel.MasterPeqLinked = false;
+                        AppSettings.Instance.MasterPeqLinked = false;
+                        AppSettings.Instance.Save();
+                        if (_selectedChannel != null) ShowChannelEditor(_selectedChannel);
+                        BodePlot.SetMasterLinkedGradient(false);
+                        await ShowErrorDialog("Failed to sync filters to the linked channel — link not enabled.");
+                        return;
+                    }
+                }
+
+                BodePlot.SetMasterLinkedGradient(ViewModel.MasterPeqLinked);
+                ViewModel.UpdateChannelSelection(channel);
+                UpdateChannelListSelection();
+            };
+            Grid.SetColumn(linkBtn, 0);
+            headerRow.Children.Add(linkBtn);
+
+            // Per-input preamp strip (label · slider · value) occupies the middle column
+            var preampStrip = new Grid
+            {
+                VerticalAlignment = VerticalAlignment.Stretch
+            };
+            preampStrip.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            preampStrip.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            preampStrip.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var preampLabel = new TextBlock
+            {
+                Text = "Preamp",
+                FontSize = 12,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 8, 0),
+                Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+            };
+            Grid.SetColumn(preampLabel, 0);
+            preampStrip.Children.Add(preampLabel);
+
+            var preampSlider = new Slider
+            {
+                Minimum = -60,
+                Maximum = 10,
+                StepFrequency = 0.5,
+                SmallChange = 0.5,
+                LargeChange = 3,
+                Value = isLeft ? ViewModel.InputPreampLDb : ViewModel.InputPreampRDb,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0),
+                Padding = new Thickness(0)
+            };
+            preampSlider.ValueChanged += (_, e) =>
+            {
+                float v = (float)e.NewValue;
+                if (isLeft)
+                {
+                    if (Math.Abs(ViewModel.InputPreampLDb - v) > 0.1f)
+                        ViewModel.InputPreampLDb = v;
+                }
+                else
+                {
+                    if (Math.Abs(ViewModel.InputPreampRDb - v) > 0.1f)
+                        ViewModel.InputPreampRDb = v;
+                }
+            };
+            preampSlider.RightTapped += (_, e) =>
+            {
+                e.Handled = true;
+                float saved = 0f;
+                var snap = ViewModel.SavedSnapshot;
+                if (snap != null)
+                    saved = isLeft ? snap.InputPreampLDb : snap.InputPreampRDb;
+                if (isLeft) ViewModel.InputPreampLDb = saved;
+                else ViewModel.InputPreampRDb = saved;
+            };
+            Grid.SetColumn(preampSlider, 1);
+            preampStrip.Children.Add(preampSlider);
+
+            var preampValue = new TextBlock
+            {
+                FontSize = 12,
+                FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Cascadia Code, Consolas"),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(8, 0, 0, 0),
+                MinWidth = 56,
+                TextAlignment = TextAlignment.Right,
+                Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"]
+            };
+            Grid.SetColumn(preampValue, 2);
+            preampStrip.Children.Add(preampValue);
+
+            // Wrap strip in a Border with the same background and rounded corners
+            // as the adjacent buttons so it reads as a unified control.
+            var preampBox = new Border
+            {
+                Background = (Brush)Application.Current.Resources["ButtonBackground"],
+                BorderBrush = (Brush)Application.Current.Resources["ButtonBorderBrush"],
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(4),
+                Padding = new Thickness(10, 0, 10, 0),
+                Margin = new Thickness(8, 0, 8, 0),
+                Height = 32,
+                VerticalAlignment = VerticalAlignment.Center,
+                Child = preampStrip
+            };
+            Grid.SetColumn(preampBox, 1);
+            headerRow.Children.Add(preampBox);
+
+            _inputPreampSlider = preampSlider;
+            _inputPreampValueText = preampValue;
+            UpdateInputPreampEditor();
+
+            var clearBtn = new Button
+            {
+                Content = new TextBlock { Text = "Clear Filters", Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] },
+                Height = 32,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            clearBtn.Click += async (s, e) =>
+            {
+                // Scope the clear to the current editor channel. When Link L/R
+                // is on, ViewModel.SetFilter mirrors each write to the linked
+                // channel automatically — so a single per-band loop covers
+                // both cases (linked = both channels, unlinked = just this one).
+                bool linked = ViewModel.MasterPeqLinked;
+                string content;
+                if (linked)
+                {
+                    var leftName = ViewModel.GetChannelName(Channel.MasterLeft);
+                    var rightName = ViewModel.GetChannelName(Channel.MasterRight);
+                    content = $"This will reset every filter band on {leftName} and {rightName}.";
+                }
+                else
+                {
+                    var name = ViewModel.GetChannelName(channel);
+                    content = $"This will reset every filter band on {name}.";
+                }
+
+                var dialog = new ContentDialog
+                {
+                    Title = "Clear filters?",
+                    Content = content,
+                    PrimaryButtonText = "Clear",
+                    CloseButtonText = "Cancel",
+                    DefaultButton = ContentDialogButton.Close,
+                    XamlRoot = Content.XamlRoot
+                };
+
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+
+                var defaultFilter = new FilterParams(FilterType.Flat, 1000f, 0.707f, 0f);
+                int targetChannel = (int)channel.Id;
+                int bandCount = ViewModel.GetFilters(channel).Count;
+                for (int b = 0; b < bandCount; b++)
+                    await ViewModel.SetFilter(targetChannel, b, defaultFilter.Clone());
+            };
+            Grid.SetColumn(clearBtn, 2);
+            headerRow.Children.Add(clearBtn);
+
+            ChannelEditorPanel.Children.Add(headerRow);
+        }
+
+        // Output channel controls: Gain, Delay, Mute
+        if (channel.IsOutput)
+        {
+            // Determine output index for matrix routing
+            _currentRouteCircles.Clear();
+            _currentRouteNameTexts.Clear();
+            _currentRouteGainTexts.Clear();
+            _currentRouteInvTexts.Clear();
+            _currentOutputIndex = -1;
+            var activeOutputs = ViewModel.ActiveOutputs;
+            for (int i = 0; i < activeOutputs.Count; i++)
+                if (activeOutputs[i].Id == channel.Id) { _currentOutputIndex = i; break; }
+
+            bool isMuted = ViewModel.GetChannelMute(channel);
+            var dimBrush = new SolidColorBrush(Color.FromArgb(160, 180, 180, 180));
+            var unitBrush = new SolidColorBrush(Color.FromArgb(140, 180, 180, 180));
+
+            var outputCard = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(128, 45, 45, 48)),
+                CornerRadius = new CornerRadius(8),
+                Padding = new Thickness(16, 4, 16, 4),
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+
+            var cardGrid = new Grid { ColumnSpacing = 16 };
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1) });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1) });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            // ── Gain section (col 0) ──
+            var gainSection = new StackPanel { Spacing = 4 };
+
+            Slider gainSlider = null!;
+            TextBox gainTextBox = null!;
+            var gainHeaderRow = new Grid { Margin = new Thickness(0, 11, 0, 0) };
+            gainHeaderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            gainHeaderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var gainLabelPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            gainLabelPanel.Children.Add(new TextBlock
+            {
+                Text = "GAIN", FontSize = 11,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = dimBrush
+            });
+            bool gainLocked = AppSettings.Instance.GainLocked.TryGetValue((int)channel.Id, out var gl) && gl;
+            var gainLockIcon = new FontIcon
+            {
+                Glyph = gainLocked ? "\uE72E" : "\uE785",
+                FontSize = 10,
+                Foreground = dimBrush,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, -4, 0, 0)
+            };
+            gainLockIcon.Tapped += (s, e) =>
+            {
+                bool locking = gainLockIcon.Glyph == "\uE785";
+                gainLockIcon.Glyph = locking ? "\uE72E" : "\uE785";
+                gainSlider.IsEnabled = !locking;
+                gainTextBox.IsEnabled = !locking;
+                AppSettings.Instance.GainLocked[(int)channel.Id] = locking;
+                AppSettings.Instance.Save();
+            };
+            gainLabelPanel.Children.Add(gainLockIcon);
+            Grid.SetColumn(gainLabelPanel, 0);
+            gainHeaderRow.Children.Add(gainLabelPanel);
+
+            var gainValuePanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
+            gainTextBox = new TextBox
+            {
+                Tag = channel, Width = 50,
+                Text = ViewModel.GetChannelGain(channel).ToString("0.00", CultureInfo.InvariantCulture),
+                FontSize = 13,
+                FontFamily = new FontFamily("Cascadia Code, Consolas"),
+                Style = (Style)RootGrid.Resources["InlineValueTextBoxStyle"]
+            };
+            gainTextBox.TextChanged += OnGainTextChanged;
+            gainTextBox.KeyDown += (s, e) =>
+            {
+                if (e.Key == Windows.System.VirtualKey.Enter)
+                {
+                    e.Handled = true;
+                    FocusSink.Focus(FocusState.Programmatic);
+                }
+            };
+            gainValuePanel.Children.Add(gainTextBox);
+            gainValuePanel.Children.Add(new TextBlock { Text = "dB", FontSize = 10, VerticalAlignment = VerticalAlignment.Center, Foreground = unitBrush });
+            gainValuePanel.PointerWheelChanged += (s, ev) =>
+            {
+                var delta = ev.GetCurrentPoint(gainValuePanel).Properties.MouseWheelDelta;
+                if (delta == 0) return;
+                int direction = delta > 0 ? 1 : -1;
+                float current = ViewModel.GetChannelGain(channel);
+                float newVal = Math.Clamp(current + direction * 0.01f, -60, 10);
+                _isUpdatingGain = true;
+                ViewModel.SetChannelGain((int)channel.Id, newVal);
+                gainTextBox.Text = newVal.ToString("0.00", CultureInfo.InvariantCulture);
+                gainSlider.Value = newVal;
+                _isUpdatingGain = false;
+                ev.Handled = true;
+            };
+            Grid.SetColumn(gainValuePanel, 1);
+            gainHeaderRow.Children.Add(gainValuePanel);
+            _currentGainTextBox = gainTextBox;
+
+            gainSection.Children.Add(gainHeaderRow);
+
+            gainSlider = new Slider
+            {
+                Minimum = -60, Maximum = 10,
+                Value = ViewModel.GetChannelGain(channel),
+                Tag = channel, StepFrequency = 1, SnapsTo = SliderSnapsTo.StepValues,
+                IsEnabled = !gainLocked
+            };
+            gainTextBox.IsEnabled = !gainLocked;
+            gainSlider.ValueChanged += OnGainSliderChanged;
+            gainSlider.RightTapped += (s, e) =>
+            {
+                e.Handled = true;
+                if (s is Slider sl && sl.Tag is Channel ch && sl.IsEnabled)
+                {
+                    float saved = 0f;
+                    if (ViewModel.SavedSnapshot?.OutputGains.TryGetValue((int)ch.Id, out var sg) == true)
+                        saved = sg;
+                    _isUpdatingGain = true;
+                    ViewModel.SetChannelGain((int)ch.Id, saved);
+                    sl.Value = saved;
+                    if (_currentGainTextBox != null)
+                        _currentGainTextBox.Text = saved.ToString("0.00", CultureInfo.InvariantCulture);
+                    _isUpdatingGain = false;
+                }
+            };
+            _currentGainSlider = gainSlider;
+
+            gainSection.Children.Add(gainSlider);
+            Grid.SetColumn(gainSection, 0);
+            cardGrid.Children.Add(gainSection);
+
+            // Vertical separator (col 1)
+            var separator = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(25, 255, 255, 255)),
+                Width = 1, VerticalAlignment = VerticalAlignment.Stretch,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            Grid.SetColumn(separator, 1);
+            cardGrid.Children.Add(separator);
+
+            // ── Delay section (col 2) ──
+            var delaySection = new StackPanel { Spacing = 4 };
+
+            Slider delaySlider = null!;
+            TextBox delayTextBox = null!;
+            var delayHeaderRow = new Grid { Margin = new Thickness(0, 11, 0, 0) };
+            delayHeaderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            delayHeaderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var delayLabelPanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+            delayLabelPanel.Children.Add(new TextBlock
+            {
+                Text = "DELAY", FontSize = 11,
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = dimBrush
+            });
+            bool delayLocked = AppSettings.Instance.DelayLocked.TryGetValue((int)channel.Id, out var dl) && dl;
+            var delayLockIcon = new FontIcon
+            {
+                Glyph = delayLocked ? "\uE72E" : "\uE785",
+                FontSize = 10,
+                Foreground = dimBrush,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, -4, 0, 0)
+            };
+            delayLockIcon.Tapped += (s, e) =>
+            {
+                bool locking = delayLockIcon.Glyph == "\uE785";
+                delayLockIcon.Glyph = locking ? "\uE72E" : "\uE785";
+                delaySlider.IsEnabled = !locking;
+                delayTextBox.IsEnabled = !locking;
+                AppSettings.Instance.DelayLocked[(int)channel.Id] = locking;
+                AppSettings.Instance.Save();
+            };
+            delayLabelPanel.Children.Add(delayLockIcon);
+            Grid.SetColumn(delayLabelPanel, 0);
+            delayHeaderRow.Children.Add(delayLabelPanel);
+
+            var delayValuePanel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2, VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right };
+            delayTextBox = new TextBox
+            {
+                Tag = channel, Width = 58,
+                Text = ViewModel.GetChannelDelay(channel).ToString("0.00##", CultureInfo.InvariantCulture),
+                FontSize = 13,
+                FontFamily = new FontFamily("Cascadia Code, Consolas"),
+                Style = (Style)RootGrid.Resources["InlineValueTextBoxStyle"]
+            };
+            delayTextBox.TextChanged += OnDelayTextChanged;
+            delayTextBox.KeyDown += (s, e) =>
+            {
+                if (e.Key == Windows.System.VirtualKey.Enter)
+                {
+                    e.Handled = true;
+                    FocusSink.Focus(FocusState.Programmatic);
+                }
+            };
+            var delayCmOverlay = new TextBlock
+            {
+                FontSize = 13,
+                FontFamily = new FontFamily("Cascadia Code, Consolas"),
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 0, 1, 0),
+                Foreground = delayTextBox.Foreground,
+                Visibility = Visibility.Collapsed
+            };
+            var delayBoxContainer = new Grid { Width = 58 };
+            delayBoxContainer.Children.Add(delayTextBox);
+            delayBoxContainer.Children.Add(delayCmOverlay);
+            delayValuePanel.Children.Add(delayBoxContainer);
+
+            var delayUnitText = new TextBlock { Text = "ms", FontSize = 10, VerticalAlignment = VerticalAlignment.Center, Foreground = unitBrush, Width = 20 };
+            delayUnitText.PointerPressed += (s, ev) =>
+            {
+                ev.Handled = true;
+                float ms = ViewModel.GetChannelDelay(channel);
+                delayCmOverlay.Text = FormatDelayCm(ms);
+                delayCmOverlay.Visibility = Visibility.Visible;
+                delayTextBox.Opacity = 0;
+                delayUnitText.Text = "cm";
+            };
+            delayUnitText.PointerReleased += (s, ev) =>
+            {
+                delayCmOverlay.Visibility = Visibility.Collapsed;
+                delayTextBox.Opacity = 1;
+                delayUnitText.Text = "ms";
+            };
+            delayUnitText.PointerExited += (s, ev) =>
+            {
+                delayCmOverlay.Visibility = Visibility.Collapsed;
+                delayTextBox.Opacity = 1;
+                delayUnitText.Text = "ms";
+            };
+            _currentDelayUnitText = delayUnitText;
+            delayValuePanel.Children.Add(delayUnitText);
+            delayValuePanel.PointerWheelChanged += (s, ev) =>
+            {
+                var delta = ev.GetCurrentPoint(delayValuePanel).Properties.MouseWheelDelta;
+                if (delta == 0) return;
+                int direction = delta > 0 ? 1 : -1;
+                float current = ViewModel.GetChannelDelay(channel);
+                float maxDelay = ViewModel.Platform == "RP2350" ? 85 : 170;
+                float newVal = Math.Clamp(current + direction, 0, maxDelay);
+                _isUpdatingDelay = true;
+                ViewModel.SetDelay((int)channel.Id, newVal);
+                delayTextBox.Text = newVal.ToString("0.00##", CultureInfo.InvariantCulture);
+                delaySlider.Value = newVal;
+                _isUpdatingDelay = false;
+                ev.Handled = true;
+            };
+            Grid.SetColumn(delayValuePanel, 1);
+            delayHeaderRow.Children.Add(delayValuePanel);
+            _currentDelayTextBox = delayTextBox;
+
+            delaySection.Children.Add(delayHeaderRow);
+
+            delaySlider = new Slider
+            {
+                Minimum = 0, Maximum = ViewModel.Platform == "RP2350" ? 85 : 170,
+                Value = ViewModel.GetChannelDelay(channel),
+                Tag = channel,
+                StepFrequency = 1,
+                SnapsTo = SliderSnapsTo.StepValues,
+                IsEnabled = !delayLocked
+            };
+            delayTextBox.IsEnabled = !delayLocked;
+            delaySlider.ValueChanged += OnDelaySliderChanged;
+            delaySlider.RightTapped += (s, e) =>
+            {
+                e.Handled = true;
+                if (s is Slider sl && sl.Tag is Channel ch && sl.IsEnabled)
+                {
+                    float saved = 0f;
+                    if (ViewModel.SavedSnapshot?.Delays.TryGetValue((int)ch.Id, out var sd) == true)
+                        saved = sd;
+                    _isUpdatingDelay = true;
+                    ViewModel.SetDelay((int)ch.Id, saved);
+                    sl.Value = saved;
+                    if (_currentDelayTextBox != null)
+                        _currentDelayTextBox.Text = saved.ToString("0.00##", CultureInfo.InvariantCulture);
+                    _isUpdatingDelay = false;
+                }
+            };
+            _currentDelaySlider = delaySlider;
+
+            delaySection.Children.Add(delaySlider);
+
+            Grid.SetColumn(delaySection, 2);
+            cardGrid.Children.Add(delaySection);
+
+            // Vertical separator (col 3)
+            var muteSeparator = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(25, 255, 255, 255)),
+                Width = 1, VerticalAlignment = VerticalAlignment.Stretch,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            Grid.SetColumn(muteSeparator, 3);
+            cardGrid.Children.Add(muteSeparator);
+
+            // ── Mute icon (col 4) ──
+            var muteBtn = new ToggleButton
+            {
+                Tag = channel, IsChecked = isMuted,
+                Padding = new Thickness(8),
+                VerticalAlignment = VerticalAlignment.Center,
+                Background = new SolidColorBrush(Colors.Transparent),
+                BorderThickness = new Thickness(0)
+            };
+            muteBtn.Content = new FontIcon
+            {
+                Glyph = isMuted ? "\uE74F" : "\uE767",
+                FontSize = 16,
+                Foreground = isMuted
+                    ? new SolidColorBrush(Color.FromArgb(255, 80, 80, 80))
+                    : new SolidColorBrush(Color.FromArgb(200, 200, 200, 200))
+            };
+            muteBtn.Click += OnMuteToggleClick;
+            Grid.SetColumn(muteBtn, 4);
+            cardGrid.Children.Add(muteBtn);
+
+            // ── Routing section (left side) ──
+            var dimGray = Color.FromArgb(90, 160, 160, 170);
+            var routeSection = new StackPanel { Spacing = 6, VerticalAlignment = VerticalAlignment.Center };
+
+            for (int input = 0; input < Channel.Inputs.Count; input++)
+            {
+                var inputCh = Channel.Inputs[input];
+                bool routed = _currentOutputIndex >= 0 && ViewModel.GetMatrixRouting(input, _currentOutputIndex);
+                float routeGain = _currentOutputIndex >= 0 ? ViewModel.GetMatrixGain(input, _currentOutputIndex) : 0f;
+                bool inverted = _currentOutputIndex >= 0 && ViewModel.GetMatrixInvert(input, _currentOutputIndex);
+                int capturedInput = input;
+
+                var cell = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+
+                // Connection circle
+                var circle = new Border
+                {
+                    Width = 14, Height = 14,
+                    CornerRadius = new CornerRadius(7),
+                    BorderThickness = routed ? new Thickness(0) : new Thickness(2),
+                    BorderBrush = new SolidColorBrush(dimGray),
+                    Background = routed ? new SolidColorBrush(inputCh.Color) : new SolidColorBrush(Colors.Transparent),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                circle.Tapped += (s, e) =>
+                {
+                    if (_currentOutputIndex < 0) return;
+                    bool nowRouted = !ViewModel.GetMatrixRouting(capturedInput, _currentOutputIndex);
+                    float g = ViewModel.GetMatrixGain(capturedInput, _currentOutputIndex);
+                    bool inv = ViewModel.GetMatrixInvert(capturedInput, _currentOutputIndex);
+                    ViewModel.SetMatrixRoute(capturedInput, _currentOutputIndex, nowRouted, g, inv);
+                };
+                _currentRouteCircles[input] = circle;
+                cell.Children.Add(circle);
+
+                // Input name
+                var nameText = new TextBlock
+                {
+                    Text = inputCh.Name,
+                    FontSize = 11,
+                    FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                    Foreground = new SolidColorBrush(routed ? inputCh.Color : dimGray),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                _currentRouteNameTexts[input] = nameText;
+                cell.Children.Add(nameText);
+
+                // Gain text — always shown, grayed out and non-interactive when unrouted.
+                // Master R's "R" glyph is wider than Master L's "L", so nudge the right
+                // row 2px left to keep the gain/inv columns visually aligned.
+                double gainLeftMargin = input == 1 ? -11 : -9;
+                var gainText = new TextBox
+                {
+                    Text = routeGain == 0f ? "0.00 dB" : string.Format(CultureInfo.InvariantCulture, "{0:+0.00;-0.00} dB", routeGain),
+                    FontSize = 10,
+                    FontFamily = new FontFamily("Cascadia Code, Consolas"),
+                    Foreground = GetRouteGainBrush(routed),
+                    Style = (Style)RootGrid.Resources["InlineValueTextBoxStyle"],
+                    Width = 64,
+                    IsHitTestVisible = routed,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(gainLeftMargin, 3, 0, 0)
+                };
+                gainText.LostFocus += (s, e) =>
+                {
+                    if (_currentOutputIndex < 0 || s is not TextBox tb) return;
+                    var str = tb.Text.Replace("dB", "").Trim();
+                    if (float.TryParse(str, NumberStyles.Float, CultureInfo.InvariantCulture, out float val))
+                    {
+                        val = Math.Clamp(val, -60f, 12f);
+                        bool en = ViewModel.GetMatrixRouting(capturedInput, _currentOutputIndex);
+                        bool inv = ViewModel.GetMatrixInvert(capturedInput, _currentOutputIndex);
+                        ViewModel.SetMatrixRoute(capturedInput, _currentOutputIndex, en, val, inv);
+                    }
+                };
+                gainText.KeyDown += (s, e) =>
+                {
+                    if (e.Key == Windows.System.VirtualKey.Enter)
+                    {
+                        e.Handled = true;
+                        FocusSink.Focus(FocusState.Programmatic);
+                    }
+                };
+                gainText.PointerWheelChanged += (s, ev) =>
+                {
+                    ev.Handled = true;
+                    if (_currentOutputIndex < 0) return;
+                    int delta = ev.GetCurrentPoint(gainText).Properties.MouseWheelDelta;
+                    float step = delta > 0 ? 0.5f : -0.5f;
+                    float current = ViewModel.GetMatrixGain(capturedInput, _currentOutputIndex);
+                    float newGain = Math.Clamp(current + step, -60f, 12f);
+                    bool en = ViewModel.GetMatrixRouting(capturedInput, _currentOutputIndex);
+                    bool inv = ViewModel.GetMatrixInvert(capturedInput, _currentOutputIndex);
+                    ViewModel.SetMatrixRoute(capturedInput, _currentOutputIndex, en, newGain, inv);
+                };
+                _currentRouteGainTexts[input] = gainText;
+                cell.Children.Add(gainText);
+
+                // INV label — always shown, grayed out and non-interactive when unrouted
+                var invText = new TextBlock
+                {
+                    Text = "INV",
+                    FontSize = 9,
+                    FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                    Foreground = GetRouteInvBrush(routed, inverted),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    IsHitTestVisible = routed,
+                    Margin = new Thickness(-2, 0, 0, 0)
+                };
+                invText.Tapped += (s, e) =>
+                {
+                    if (_currentOutputIndex < 0) return;
+                    bool nowInv = !ViewModel.GetMatrixInvert(capturedInput, _currentOutputIndex);
+                    bool en = ViewModel.GetMatrixRouting(capturedInput, _currentOutputIndex);
+                    float g = ViewModel.GetMatrixGain(capturedInput, _currentOutputIndex);
+                    ViewModel.SetMatrixRoute(capturedInput, _currentOutputIndex, en, g, nowInv);
+                };
+                _currentRouteInvTexts[input] = invText;
+                cell.Children.Add(invText);
+
+                routeSection.Children.Add(cell);
+            }
+
+            // ── Reorganize card: Route section | separator | Gain | sep | Delay | sep | Mute ──
+            cardGrid.ColumnDefinitions.Insert(0, new ColumnDefinition { Width = GridLength.Auto });
+            cardGrid.ColumnDefinitions.Insert(1, new ColumnDefinition { Width = new GridLength(1) });
+
+            // Shift existing children right by 2 columns
+            foreach (var child in cardGrid.Children)
+            {
+                if (child is FrameworkElement fe)
+                    Grid.SetColumn(fe, Grid.GetColumn(fe) + 2);
+            }
+
+            // Add route section at col 0
+            Grid.SetColumn(routeSection, 0);
+            cardGrid.Children.Add(routeSection);
+
+            // Add separator at col 1
+            var routeSep = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(25, 255, 255, 255)),
+                Width = 1, VerticalAlignment = VerticalAlignment.Stretch,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+            Grid.SetColumn(routeSep, 1);
+            cardGrid.Children.Add(routeSep);
+
+            outputCard.Child = cardGrid;
+            ChannelEditorPanel.Children.Add(outputCard);
+        }
+
+        // Filter rows
+        var filters = ViewModel.GetFilters(channel);
+        for (int i = 0; i < filters.Count; i++)
+        {
+            ChannelEditorPanel.Children.Add(CreateFilterEditorRow(channel, i, filters[i]));
+        }
+    }
+
+    private Border CreateFilterEditorRow(Channel channel, int bandIndex, FilterParams p)
+    {
+        var row = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(128, 45, 45, 48)),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(8, 6, 8, 6),
+            Margin = new Thickness(0, 2, 0, 0)
+        };
+
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(60) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(120) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(72) }); // Freq
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(56) }); // Q
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(54) }); // Gain
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnSpacing = 16;
+
+        // Band label
+        var bandLabel = new TextBlock
+        {
+            Text = $"Band {bandIndex + 1}",
+            FontSize = 12,
+            FontFamily = new FontFamily("Cascadia Code"),
+            Foreground = new SolidColorBrush(Colors.Gray),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(bandLabel, 0);
+        grid.Children.Add(bandLabel);
+
+        // Filter type selector
+        var typeCombo = new ComboBox { Width = 120, Tag = (channel, bandIndex), Foreground = (Brush)Application.Current.Resources["TextFillColorSecondaryBrush"] };
+        foreach (var type in Enum.GetValues<FilterType>())
+        {
+            typeCombo.Items.Add(new ComboBoxItem { Content = type.GetDisplayName(), Tag = type });
+        }
+        typeCombo.SelectedIndex = (int)p.Type;
+        typeCombo.SelectionChanged += OnFilterTypeChanged;
+        Grid.SetColumn(typeCombo, 1);
+        grid.Children.Add(typeCombo);
+
+        // Frequency
+        if (p.Type != FilterType.Flat)
+        {
+            var freqPanel = CreateValueField("Hz", p.Frequency, 58, (channel, bandIndex, "freq"));
+            Grid.SetColumn(freqPanel, 2);
+            grid.Children.Add(freqPanel);
+        }
+
+        // Q
+        if (p.Type.HasQ())
+        {
+            var qPanel = CreateValueField("Q", p.Q, 44, (channel, bandIndex, "q"), decimals: 3);
+            Grid.SetColumn(qPanel, 3);
+            grid.Children.Add(qPanel);
+        }
+
+        // Gain (for peaking, low shelf, high shelf)
+        if (p.Type.HasGain())
+        {
+            var gainPanel = CreateValueField("dB", p.Gain, 40, (channel, bandIndex, "gain"));
+            Grid.SetColumn(gainPanel, 4);
+            grid.Children.Add(gainPanel);
+        }
+
+        row.Child = grid;
+        return row;
+    }
+
+    private static string FormatFilterValue(float value, int decimals = 2) =>
+        decimals > 0 ? value.ToString($"F{decimals}", CultureInfo.InvariantCulture).TrimEnd('0').TrimEnd('.') : value.ToString("F0", CultureInfo.InvariantCulture);
+
+    private static string FormatFilterValueSigned(float value) =>
+        (value >= 0 ? "+" : "") + FormatFilterValue(value);
+
+    private StackPanel CreateValueField(string label, float value, double width, (Channel channel, int band, string param) tag, int decimals = 2)
+    {
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 2 };
+
+        var textBox = new TextBox
+        {
+            Width = width,
+            Text = FormatFilterValue(value, decimals),
+            Tag = tag,
+            FontSize = 13,
+            FontFamily = new FontFamily("Cascadia Code, Consolas"),
+            Style = (Style)RootGrid.Resources["InlineValueTextBoxStyle"]
+        };
+        textBox.LostFocus += OnFilterValueChanged;
+        textBox.KeyDown += (s, e) =>
+        {
+            if (e.Key == Windows.System.VirtualKey.Enter)
+            {
+                e.Handled = true;
+                OnFilterValueChanged(s, null!);
+                // Move focus to hidden sink to clear selection and cursor
+                FocusSink.Focus(FocusState.Programmatic);
+            }
+        };
+
+        panel.Children.Add(textBox);
+        panel.Children.Add(new TextBlock
+        {
+            Text = label,
+            FontSize = 10,
+            Foreground = (SolidColorBrush)Application.Current.Resources["TextFillColorTertiaryBrush"],
+            VerticalAlignment = VerticalAlignment.Center
+        });
+
+        panel.PointerWheelChanged += (s, e) =>
+        {
+            var delta = e.GetCurrentPoint(panel).Properties.MouseWheelDelta;
+            if (delta == 0) return;
+
+            var now = DateTime.UtcNow;
+            bool fast = (now - _lastFilterScrollTime).TotalMilliseconds < 40;
+            _lastFilterScrollTime = now;
+
+            int direction = delta > 0 ? 1 : -1;
+
+            var filters = ViewModel.GetFilters(tag.channel);
+            if (tag.band >= filters.Count) return;
+            var p = filters[tag.band].Clone();
+
+            switch (tag.param)
+            {
+                case "freq":
+                    p.Frequency = Math.Clamp(p.Frequency + direction * (fast ? 10 : 1), 20, 20000);
+                    break;
+                case "q":
+                    p.Q = Math.Clamp(p.Q + direction * (fast ? 0.1f : 0.01f), 0.1f, 20);
+                    break;
+                case "gain":
+                    p.Gain = Math.Clamp(p.Gain + direction * (fast ? 0.1f : 0.01f), -20, 20);
+                    break;
+            }
+
+            _isScrollAdjusting = true;
+            ViewModel.SetFilterDeferred((int)tag.channel.Id, tag.band, p);
+            _isScrollAdjusting = false;
+            textBox.Text = FormatFilterValue(
+                tag.param == "freq" ? p.Frequency : tag.param == "q" ? p.Q : p.Gain,
+                tag.param == "q" ? 3 : tag.param == "freq" ? 0 : 2);
+            e.Handled = true;
+        };
+
+        return panel;
+    }
+
+    private void ShowDashboard()
+    {
+        _selectedChannel = null;
+        BodePlot.SetMasterLinkedGradient(ViewModel.MasterPeqLinked);
+        BodePlot.SetSelectedChannel(-1);
+        if (AppSettings.Instance.PopoutFollowsSelectedChannel)
+            _graphWindow?.SetSelectedChannel(-1);
+        ChannelEditorPanel.Visibility = Visibility.Collapsed;
+        DashboardPanel.Visibility = Visibility.Visible;
+        InitializeDashboard(); // Refresh
+    }
+
+    #region Event Handlers
+
+    private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            switch (e.PropertyName)
+            {
+                case nameof(MainViewModel.IsDeviceConnected):
+                    UpdateConnectionStatus();
+                    break;
+                case nameof(MainViewModel.ErrorMessage):
+                    UpdateConnectionStatus();
+                    break;
+                case nameof(MainViewModel.SelectedDeviceItem):
+                    UpdateConnectionStatus();
+                    break;
+                case nameof(MainViewModel.MasterVolumeDb):
+                    UpdateMasterVolumeDisplay();
+                    break;
+                case nameof(MainViewModel.InputPreampLDb):
+                case nameof(MainViewModel.InputPreampRDb):
+                    UpdateInputPreampEditor();
+                    break;
+                case nameof(MainViewModel.Bypass):
+                    UpdateBypassButton();
+                    break;
+                case nameof(MainViewModel.LoudnessEnabled):
+                    UpdateShortcutIconStates();
+                    break;
+                case nameof(MainViewModel.CrossfeedEnabled):
+                    UpdateShortcutIconStates();
+                    break;
+                case nameof(MainViewModel.LevellerEnabled):
+                    UpdateShortcutIconStates();
+                    break;
+                case nameof(MainViewModel.Status):
+                    UpdateMeters();
+                    break;
+            }
+        });
+    }
+
+    private void UpdateConnectionStatus()
+    {
+        var accentColor = (Windows.UI.Color)Application.Current.Resources["SystemAccentColor"];
+        ConnectionIndicator.Fill = new SolidColorBrush(ViewModel.IsDeviceConnected ? accentColor : Colors.Red);
+        UpdateDeviceSelector();
+
+        if (!ViewModel.IsDeviceConnected)
+        {
+            InputChannelsList.Items.Clear();
+            OutputChannelsList.Items.Clear();
+            _channelListItems.Clear();
+            _outputChannelItems.Clear();
+            _channelMeters.Clear();
+
+            FadeCurves(0);
+            FadeElement(LegendPanel, 0);
+
+            // Hide preset and source sections
+            PresetSection.Visibility = Visibility.Collapsed;
+            SourceSection.Visibility = Visibility.Collapsed;
+
+            // Return to empty dashboard view
+            _selectedChannel = null;
+            ChannelEditorPanel.Visibility = Visibility.Collapsed;
+            ChannelEditorPanel.Children.Clear();
+            DashboardPanel.Visibility = Visibility.Visible;
+            DashboardPanel.Children.Clear();
+        }
+        else
+        {
+            InitializeChannelLists();
+            InitializeLegend();
+
+            FadeCurves(1);
+            FadeElement(LegendPanel, 1);
+        }
+    }
+
+    // Multi-device UI
+
+    private void UpdateDeviceSelector()
+    {
+        var selected = ViewModel.SelectedDeviceItem
+                       ?? ViewModel.Device.SelectedDeviceInfo;
+
+        if (selected != null)
+            DeviceSelectorText.Text = selected.DisplayName;
+        else
+            DeviceSelectorText.Text = ViewModel.ErrorMessage ?? "Disconnected";
+    }
+
+    private void OnDeviceSelectorPointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        DeviceSelectorBtn.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(0x20, 0xFF, 0xFF, 0xFF));
+        DeviceSelectorBtn.BorderBrush = new SolidColorBrush(Windows.UI.Color.FromArgb(0x30, 0xFF, 0xFF, 0xFF));
+    }
+
+    private void OnDeviceSelectorPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        DeviceSelectorBtn.Background = new SolidColorBrush(Colors.Transparent);
+        DeviceSelectorBtn.BorderBrush = new SolidColorBrush(Colors.Transparent);
+    }
+
+    private void OnDeviceSelectorTapped(object sender, TappedRoutedEventArgs e)
+    {
+        var devices = ViewModel.AvailableDevices;
+        if (devices.Count == 0) return;
+
+        var flyout = new MenuFlyout { Placement = Microsoft.UI.Xaml.Controls.Primitives.FlyoutPlacementMode.BottomEdgeAlignedLeft };
+        var current = ViewModel.Device.SelectedDeviceInfo;
+
+        foreach (var d in devices)
+        {
+            var device = d;
+            var item = new MenuFlyoutItem { Text = device.DisplayName };
+            if (current != null && device.Serial == current.Serial)
+                item.Icon = new FontIcon { Glyph = "\uE73E" };
+            item.Click += (s, args) =>
+            {
+                if (current == null || device.Serial != current.Serial)
+                    ViewModel.SwitchToDeviceCommand.Execute(device);
+            };
+            flyout.Items.Add(item);
+        }
+
+        flyout.ShowAt(DeviceSelectorBtn);
+    }
+
+
+
+    /// <summary>
+    /// Prompt the user to pick which input channel's filters should win when
+    /// enabling Link L/R against differing banks. Returns the chosen channel
+    /// id, or null if the user cancelled.
+    /// </summary>
+    private async Task<int?> AskWhichMasterFiltersToKeep()
+    {
+        var leftName = ViewModel.GetChannelName(Channel.MasterLeft);
+        var rightName = ViewModel.GetChannelName(Channel.MasterRight);
+
+        var dialog = new ContentDialog
+        {
+            Title = $"{leftName} and {rightName} have different filters",
+            Content = "Linking will overwrite one channel's filters with the other's. Which would you like to keep?",
+            PrimaryButtonText = $"Keep {leftName}",
+            SecondaryButtonText = $"Keep {rightName}",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        return await dialog.ShowAsync() switch
+        {
+            ContentDialogResult.Primary => (int)ChannelId.MasterLeft,
+            ContentDialogResult.Secondary => (int)ChannelId.MasterRight,
+            _ => (int?)null
+        };
+    }
+
+    private async Task<UnsavedAction> ShowUnsavedChangesDialogAsync(string? summary)
+    {
+        var message = summary != null
+            ? $"You have unsaved changes to the current preset:\n\n{summary}\n\nSave before switching devices?"
+            : "You have unsaved changes to the current preset.\n\nSave before switching devices?";
+
+        var dialog = new ContentDialog
+        {
+            Title = "Unsaved Changes",
+            Content = message,
+            PrimaryButtonText = "Save",
+            SecondaryButtonText = "Discard",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        var result = await dialog.ShowAsync();
+        return result switch
+        {
+            ContentDialogResult.Primary => UnsavedAction.Save,
+            ContentDialogResult.Secondary => UnsavedAction.Discard,
+            _ => UnsavedAction.Cancel
+        };
+    }
+
+    private DispatcherTimer? _curveFadeTimer;
+    private double _curveFadeTarget;
+
+    private void FadeCurves(double targetOpacity)
+    {
+        _curveFadeTarget = targetOpacity;
+        _curveFadeTimer?.Stop();
+        _curveFadeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _curveFadeTimer.Tick += (s, e) =>
+        {
+            double current = BodePlot.GetCurveOpacity();
+            double diff = _curveFadeTarget - current;
+            if (Math.Abs(diff) < 0.02)
+            {
+                BodePlot.SetCurveOpacity(_curveFadeTarget);
+                _curveFadeTimer.Stop();
+            }
+            else
+            {
+                BodePlot.SetCurveOpacity(current + diff * 0.15);
+            }
+        };
+        _curveFadeTimer.Start();
+    }
+
+    private void FadeElement(UIElement element, double targetOpacity)
+    {
+        var animation = new DoubleAnimation
+        {
+            To = targetOpacity,
+            Duration = new Duration(TimeSpan.FromMilliseconds(250)),
+            EasingFunction = new CubicEase { EasingMode = targetOpacity == 0 ? EasingMode.EaseOut : EasingMode.EaseIn }
+        };
+        var sb = new Storyboard();
+        sb.Children.Add(animation);
+        Storyboard.SetTarget(animation, element);
+        Storyboard.SetTargetProperty(animation, "Opacity");
+        sb.Begin();
+    }
+
+    private void UpdateInputPreampEditor()
+    {
+        if (_inputPreampSlider == null || _inputPreampValueText == null) return;
+        if (_selectedChannel == null) return;
+        bool isLeft = _selectedChannel.Id == ChannelId.MasterLeft;
+        bool isRight = _selectedChannel.Id == ChannelId.MasterRight;
+        if (!isLeft && !isRight) return;
+        float v = isLeft ? ViewModel.InputPreampLDb : ViewModel.InputPreampRDb;
+        if (Math.Abs(_inputPreampSlider.Value - v) > 0.05)
+            _inputPreampSlider.Value = v;
+        _inputPreampValueText.Text = $"{v:F1} dB";
+    }
+
+    // Discrete master-volume taper:
+    //   0 to -30 dB in 0.5 dB steps (loudest region, fine resolution)
+    //   -30 to -60 dB in 1 dB steps
+    //   -60 to -128 dB in 5 dB steps, with -128 reserved as mute sentinel
+    // Position 0 = -128 (mute), position Max = 0 dB.
+    private static readonly float[] MasterVolumeSteps = BuildMasterVolumeSteps();
+    private static float[] BuildMasterVolumeSteps()
+    {
+        var list = new List<float> { -128f };
+        for (float db = -125f; db <= -65f + 0.001f; db += 5f) list.Add(db);
+        for (float db = -60f; db <= -31f + 0.001f; db += 1f) list.Add(db);
+        for (float db = -30f; db <= 0f + 0.001f; db += 0.5f) list.Add(MathF.Round(db, 1));
+        return list.ToArray();
+    }
+
+    private static int MasterVolumeDbToSliderPos(double db)
+    {
+        int best = 0;
+        double bestDelta = double.MaxValue;
+        for (int i = 0; i < MasterVolumeSteps.Length; i++)
+        {
+            double d = Math.Abs(MasterVolumeSteps[i] - db);
+            if (d < bestDelta) { bestDelta = d; best = i; }
+        }
+        return best;
+    }
+
+    private static double MasterVolumeSliderPosToDb(double pos)
+    {
+        int idx = Math.Clamp((int)Math.Round(pos), 0, MasterVolumeSteps.Length - 1);
+        return MasterVolumeSteps[idx];
+    }
+
+    private bool _updatingMasterVolumeSlider;
+
+    private void UpdateMasterVolumeDisplay()
+    {
+        var v = ViewModel.MasterVolumeDb;
+        _updatingMasterVolumeSlider = true;
+        try
+        {
+            var pos = MasterVolumeDbToSliderPos(v);
+            if (Math.Abs(MasterVolumeSlider.Value - pos) > 0.5)
+                MasterVolumeSlider.Value = pos;
+        }
+        finally
+        {
+            _updatingMasterVolumeSlider = false;
+        }
+        MasterVolumeValueText.Text = v <= -127.5f ? "-inf dB" : $"{v:F1} dB";
+    }
+
+    private void UpdateBypassButton()
+    {
+        UpdateShortcutIconStates();
+    }
+
+    private void UpdateMeters()
+    {
+        var status = ViewModel.Status;
+
+        // Update inline per-channel meters
+        foreach (var (channelId, meter) in _channelMeters)
+        {
+            if (channelId < status.Peaks.Length)
+                meter.Level = status.Peaks[channelId];
+            meter.IsClipping = status.IsClipping((ChannelId)channelId);
+            var channel = Channel.FromIndex(channelId);
+            meter.IsMuted = channel.IsOutput && ViewModel.GetChannelMute(channel);
+        }
+
+        // Workaround: firmware reports 100% for Core 1 when idle/no audio
+        // Treat 0%/100% as uninitialized and show 0% for both
+        if (status.Cpu0Load == 0 && status.Cpu1Load == 100)
+        {
+            Cpu0Meter.Load = 0;
+            Cpu1Meter.Load = 0;
+        }
+        else
+        {
+            Cpu0Meter.Load = status.Cpu0Load;
+            Cpu1Meter.Load = status.Cpu1Load;
+        }
+    }
+
+    private void OnChannelItemTapped(object sender, TappedRoutedEventArgs e)
+    {
+        if (sender is not ListViewItem item || item.Tag is not (Channel channel, int index))
+            return;
+
+        if (_selectedChannelIndex == index)
+        {
+            // Same channel clicked - go back to dashboard
+            _selectedChannelIndex = 0;
+            UpdateChannelListSelection();
+            ViewModel.UpdateChannelSelection(null);
+            ShowDashboard();
+        }
+        else
+        {
+            // Different channel clicked - select it
+            _selectedChannelIndex = index;
+            UpdateChannelListSelection();
+            ViewModel.UpdateChannelSelection(channel);
+            ShowChannelEditor(channel);
+        }
+    }
+
+    /// <summary>
+    /// When hovering a master channel item with link enabled, force the other master
+    /// item into PointerOver visual state so both highlight together.
+    /// </summary>
+    private void OnMasterItemPointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ViewModel.MasterPeqLinked) return;
+        var other = GetPairedMasterItem(sender);
+        if (other != null)
+            VisualStateManager.GoToState(other, "PointerOver", true);
+    }
+
+    private void OnMasterItemPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        if (!ViewModel.MasterPeqLinked) return;
+        var other = GetPairedMasterItem(sender);
+        if (other == null) return;
+
+        // If the other item is selected, restore to Selected state, not Normal
+        bool isSelected = InputChannelsList.SelectedItems.Contains(other);
+        VisualStateManager.GoToState(other, isSelected ? "Selected" : "Normal", true);
+    }
+
+    /// <summary>
+    /// Finds the other master channel ListViewItem in the InputChannelsList.
+    /// </summary>
+    private ListViewItem? GetPairedMasterItem(object sender)
+    {
+        if (sender is not ListViewItem item || item.Tag is not (Channel ch, int _)) return null;
+        var targetId = ch.Id == ChannelId.MasterLeft ? ChannelId.MasterRight : ChannelId.MasterLeft;
+        foreach (var child in InputChannelsList.Items)
+        {
+            if (child is ListViewItem other && other.Tag is (Channel otherCh, int _) && otherCh.Id == targetId)
+                return other;
+        }
+        return null;
+    }
+
+    private void UpdateChannelListSelection()
+    {
+        // Clear all selections first
+        InputChannelsList.SelectedItem = null;
+        OutputChannelsList.SelectedItem = null;
+
+        // If a channel is selected (index > 0), highlight it
+        if (_selectedChannelIndex > 0 && _selectedChannelIndex <= _channelListItems.Count)
+        {
+            var item = _channelListItems[_selectedChannelIndex - 1];
+
+            // When linked and a master channel is selected, highlight both master items
+            if (ViewModel.MasterPeqLinked && item.Tag is (Channel ch, int _) &&
+                (ch.Id == ChannelId.MasterLeft || ch.Id == ChannelId.MasterRight) &&
+                Channel.Inputs.Count >= 2)
+            {
+                InputChannelsList.SelectionMode = ListViewSelectionMode.Multiple;
+                InputChannelsList.SelectedItems.Clear();
+                foreach (var inputItem in InputChannelsList.Items)
+                    InputChannelsList.SelectedItems.Add(inputItem);
+            }
+            else
+            {
+                InputChannelsList.SelectionMode = ListViewSelectionMode.Single;
+                if (InputChannelsList.Items.Contains(item))
+                    InputChannelsList.SelectedItem = item;
+                else if (OutputChannelsList.Items.Contains(item))
+                    OutputChannelsList.SelectedItem = item;
+            }
+        }
+        else
+        {
+            // Nothing selected — ensure single mode
+            InputChannelsList.SelectionMode = ListViewSelectionMode.Single;
+        }
+    }
+
+    private void OnMasterVolumeSliderChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (_updatingMasterVolumeSlider) return;
+        float db = (float)MasterVolumeSliderPosToDb(e.NewValue);
+        if (Math.Abs(ViewModel.MasterVolumeDb - db) > 0.05f)
+            ViewModel.MasterVolumeDb = db;
+        MasterVolumeValueText.Text = db <= -127.5f ? "-inf dB" : $"{db:F1} dB";
+    }
+
+    private void OnReconnectClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ReconnectCommand.Execute(null);
+    }
+
+    private void OnConnectionStatusRightTapped(object sender, RightTappedRoutedEventArgs e)
+    {
+        e.Handled = true;
+        ViewModel.ReconnectCommand.Execute(null);
+    }
+
+    private void OnClearAllMasterClick(object sender, RoutedEventArgs e)
+    {
+        ViewModel.ClearAllMasterCommand.Execute(null);
+    }
+
+    private void OnDelaySliderChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (_isUpdatingDelay) return;
+        if (sender is Slider slider && slider.Tag is Channel channel)
+        {
+            _isUpdatingDelay = true;
+            float snapped = MathF.Round((float)e.NewValue);
+            ViewModel.SetDelay((int)channel.Id, snapped);
+            if (_currentDelayTextBox != null)
+            {
+                _currentDelayTextBox.Text = snapped.ToString("0.00##", CultureInfo.InvariantCulture);
+            }
+            _isUpdatingDelay = false;
+        }
+    }
+
+    private void OnDelayTextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_isUpdatingDelay) return;
+        if (sender is TextBox textBox && textBox.Tag is Channel channel)
+        {
+            if (float.TryParse(textBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out float value))
+            {
+                _isUpdatingDelay = true;
+                value = Math.Clamp(value, 0, ViewModel.Platform == "RP2350" ? 85 : 170);
+                ViewModel.SetDelay((int)channel.Id, value);
+                if (_currentDelaySlider != null)
+                {
+                    _currentDelaySlider.Value = value;
+                }
+                _isUpdatingDelay = false;
+            }
+        }
+    }
+
+    private string FormatDelayCm(float ms)
+    {
+        if (ms == 0f) return "0";
+        uint sr = ViewModel.SampleRateHz;
+        if (sr == 0) sr = 48000;
+        float samples = MathF.Round(ms / 1000f * sr);
+        float cm = samples / sr * 34300f;
+        return string.Format(CultureInfo.InvariantCulture, "{0:0.#}", cm);
+    }
+
+    private void OnGainSliderChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
+    {
+        if (_isUpdatingGain) return;
+        if (sender is Slider slider && slider.Tag is Channel channel)
+        {
+            _isUpdatingGain = true;
+            float snapped = MathF.Round((float)e.NewValue);
+            ViewModel.SetChannelGain((int)channel.Id, snapped);
+            if (_currentGainTextBox != null)
+            {
+                _currentGainTextBox.Text = snapped.ToString("0.00", CultureInfo.InvariantCulture);
+            }
+            _isUpdatingGain = false;
+        }
+    }
+
+    private void OnGainTextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_isUpdatingGain) return;
+        if (sender is TextBox textBox && textBox.Tag is Channel channel)
+        {
+            if (float.TryParse(textBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out float value))
+            {
+                _isUpdatingGain = true;
+                value = Math.Clamp(value, -60, 10);
+                ViewModel.SetChannelGain((int)channel.Id, value);
+                if (_currentGainSlider != null)
+                {
+                    _currentGainSlider.Value = value;
+                }
+                _isUpdatingGain = false;
+            }
+        }
+    }
+
+    private void SyncGainFromViewModel(int outputIndex)
+    {
+        var outputs = ViewModel.ActiveOutputs;
+        if (outputIndex < 0 || outputIndex >= outputs.Count) return;
+        var channel = outputs[outputIndex];
+
+        RefreshDashboardHeaderStats(channel);
+
+        if (_selectedChannel != null && _selectedChannel.Id == channel.Id)
+        {
+            float gain = ViewModel.GetChannelGain(_selectedChannel);
+            _isUpdatingGain = true;
+            if (_currentGainSlider != null)
+                _currentGainSlider.Value = gain;
+            if (_currentGainTextBox != null && _currentGainTextBox.FocusState == FocusState.Unfocused)
+                _currentGainTextBox.Text = gain.ToString("0.00", CultureInfo.InvariantCulture);
+            _isUpdatingGain = false;
+        }
+    }
+
+    private void SyncDelayFromViewModel(int outputIndex)
+    {
+        var outputs = ViewModel.ActiveOutputs;
+        if (outputIndex < 0 || outputIndex >= outputs.Count) return;
+        var channel = outputs[outputIndex];
+
+        RefreshDashboardHeaderStats(channel);
+
+        if (_selectedChannel != null && _selectedChannel.Id == channel.Id)
+        {
+            float delay = ViewModel.GetChannelDelay(_selectedChannel);
+            _isUpdatingDelay = true;
+            if (_currentDelaySlider != null)
+                _currentDelaySlider.Value = delay;
+            if (_currentDelayTextBox != null && _currentDelayTextBox.FocusState == FocusState.Unfocused)
+                _currentDelayTextBox.Text = delay.ToString("0.00##", CultureInfo.InvariantCulture);
+            _isUpdatingDelay = false;
+        }
+    }
+
+    private void SyncRouteIndicator(int input, int output)
+    {
+        if (output != _currentOutputIndex) return;
+        if (!_currentRouteCircles.ContainsKey(input)) return;
+
+        var inputCh = Channel.Inputs[input];
+        bool routed = ViewModel.GetMatrixRouting(input, output);
+        float gain = ViewModel.GetMatrixGain(input, output);
+        bool inverted = ViewModel.GetMatrixInvert(input, output);
+        var dimGray = Color.FromArgb(90, 160, 160, 170);
+
+        var circle = _currentRouteCircles[input];
+        circle.Background = routed ? new SolidColorBrush(inputCh.Color) : new SolidColorBrush(Colors.Transparent);
+        circle.BorderThickness = routed ? new Thickness(0) : new Thickness(2);
+
+        var nameText = _currentRouteNameTexts[input];
+        nameText.Foreground = new SolidColorBrush(routed ? inputCh.Color : dimGray);
+
+        var gainText = _currentRouteGainTexts[input];
+        gainText.IsHitTestVisible = routed;
+        gainText.Foreground = GetRouteGainBrush(routed);
+        if (gainText.FocusState == FocusState.Unfocused)
+            gainText.Text = gain == 0f ? "0.00 dB" : string.Format(CultureInfo.InvariantCulture, "{0:+0.00;-0.00} dB", gain);
+
+        var invText = _currentRouteInvTexts[input];
+        invText.IsHitTestVisible = routed;
+        invText.Foreground = GetRouteInvBrush(routed, inverted);
+    }
+
+    private static Brush GetRouteGainBrush(bool routed) =>
+        new SolidColorBrush(routed ? Color.FromArgb(140, 255, 255, 255) : Color.FromArgb(45, 255, 255, 255));
+
+    private static Brush GetRouteInvBrush(bool routed, bool inverted)
+    {
+        if (!routed) return new SolidColorBrush(Color.FromArgb(30, 200, 200, 220));
+        return new SolidColorBrush(inverted ? Color.FromArgb(175, 255, 255, 255) : Color.FromArgb(60, 200, 200, 220));
+    }
+
+    private void RefreshDashboardHeaderStats(Channel channel)
+    {
+        if (!_dashboardHeaderStats.TryGetValue((int)channel.Id, out var tb)) return;
+        float gain = ViewModel.GetChannelGain(channel);
+        float delay = ViewModel.GetChannelDelay(channel);
+        bool muted = ViewModel.GetChannelMute(channel);
+        tb.Text = $"{gain:F1}dB  {delay:F0}ms{(muted ? "  MUTED" : "")}";
+        tb.Foreground = new SolidColorBrush(muted ? Color.FromArgb(255, 200, 80, 80) : Colors.Gray);
+    }
+
+    private void OnMuteToggleClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is ToggleButton btn && btn.Tag is Channel channel)
+        {
+            bool muted = btn.IsChecked == true;
+            ViewModel.SetChannelMute((int)channel.Id, muted);
+
+            // Update icon appearance
+            if (btn.Content is FontIcon icon)
+            {
+                icon.Glyph = muted ? "\uE74F" : "\uE767";
+                icon.Foreground = muted
+                    ? new SolidColorBrush(Color.FromArgb(255, 80, 80, 80))
+                    : new SolidColorBrush(Color.FromArgb(200, 200, 200, 200));
+            }
+
+            RefreshDashboardHeaderStats(channel);
+        }
+    }
+
+    private void OnFilterTypeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (sender is ComboBox combo && combo.Tag is (Channel channel, int bandIndex))
+        {
+            if (combo.SelectedItem is ComboBoxItem item && item.Tag is FilterType newType)
+            {
+                var filters = ViewModel.GetFilters(channel);
+                if (bandIndex < filters.Count)
+                {
+                    var p = filters[bandIndex].Clone();
+                    p.Type = newType;
+                    _ = ViewModel.SetFilter((int)channel.Id, bandIndex, p);
+
+                    // Refresh the row
+                    if (_selectedChannel != null)
+                    {
+                        ShowChannelEditor(_selectedChannel);
+                    }
+                }
+            }
+        }
+    }
+
+    private void OnFilterValueChanged(object sender, RoutedEventArgs e)
+    {
+        if (sender is TextBox textBox && textBox.Tag is (Channel channel, int bandIndex, string param))
+        {
+            if (float.TryParse(textBox.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out float value))
+            {
+                var filters = ViewModel.GetFilters(channel);
+                if (bandIndex < filters.Count)
+                {
+                    var p = filters[bandIndex].Clone();
+
+                    switch (param)
+                    {
+                        case "freq":
+                            p.Frequency = Math.Clamp(value, 20, 20000);
+                            break;
+                        case "q":
+                            p.Q = Math.Clamp(value, 0.1f, 20);
+                            break;
+                        case "gain":
+                            p.Gain = Math.Clamp(value, -20, 20);
+                            break;
+                    }
+
+                    _ = ViewModel.SetFilter((int)channel.Id, bandIndex, p);
+                }
+            }
+        }
+    }
+
+    #endregion
+
+    #region Menu Handlers
+
+    #region Preset Handlers
+
+    private void RefreshPresetComboBox()
+    {
+        _isUpdatingPresetCombo = true;
+        try
+        {
+            if (!ViewModel.PresetsSupported)
+            {
+                PresetSection.Visibility = Visibility.Collapsed;
+                PresetComboBox.Items.Clear();
+                return;
+            }
+
+            PresetSection.Visibility = ViewModel.IsDeviceConnected ? Visibility.Visible : Visibility.Collapsed;
+
+            // Only clear+rebuild items if their content has actually changed.
+            // Tearing down and re-adding items while the ComboBox is in a focus
+            // or flyout transition can throw inside Microsoft.ui.xaml.
+            bool itemsMatch = PresetComboBox.Items.Count == MainViewModel.PresetSlotCount;
+            if (itemsMatch)
+            {
+                for (int i = 0; i < MainViewModel.PresetSlotCount; i++)
+                {
+                    if (PresetComboBox.Items[i] is ComboBoxItem cbi &&
+                        cbi.Content is string s &&
+                        s == ViewModel.GetPresetDisplayName(i))
+                        continue;
+                    itemsMatch = false;
+                    break;
+                }
+            }
+
+            if (!itemsMatch)
+            {
+                PresetComboBox.Items.Clear();
+                for (int i = 0; i < MainViewModel.PresetSlotCount; i++)
+                {
+                    PresetComboBox.Items.Add(new ComboBoxItem
+                    {
+                        Content = ViewModel.GetPresetDisplayName(i),
+                        Tag = i
+                    });
+                }
+            }
+
+            UpdateActivePresetSelection();
+            UpdatePresetDirtyIndicator();
+        }
+        finally
+        {
+            _isUpdatingPresetCombo = false;
+        }
+    }
+
+    private void UpdateActivePresetSelection()
+    {
+        _isUpdatingPresetCombo = true;
+        try
+        {
+            int target = ViewModel.ActivePreset >= 0 && ViewModel.ActivePreset < PresetComboBox.Items.Count
+                ? ViewModel.ActivePreset
+                : -1;
+            if (PresetComboBox.SelectedIndex != target)
+                PresetComboBox.SelectedIndex = target;
+        }
+        finally
+        {
+            _isUpdatingPresetCombo = false;
+        }
+    }
+
+    private void UpdateWindowTitle()
+    {
+        var title = ViewModel.PresetsDirty
+            ? "DSPi Console — Unsaved Changes"
+            : "DSPi Console";
+        if (AppTitleText != null)
+            AppTitleText.Text = title;
+        var appWindow = GetAppWindow();
+        if (appWindow != null)
+            appWindow.Title = title;
+    }
+
+    // Positions an overlay "*" immediately after the active preset's name inside
+    // the ComboBox, without letting it affect the ComboBox's measured width.
+    private void UpdatePresetDirtyIndicator()
+    {
+        try
+        {
+            if (!ViewModel.PresetsDirty || ViewModel.ActivePreset < 0 ||
+                ViewModel.ActivePreset >= MainViewModel.PresetSlotCount ||
+                !ViewModel.PresetsSupported)
+            {
+                PresetDirtyIndicator.Visibility = Visibility.Collapsed;
+                PresetSaveButton.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            PresetSaveButton.Visibility = AppSettings.Instance.ShowPresetSaveButton
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+            var name = ViewModel.GetPresetDisplayName(ViewModel.ActivePreset);
+            var measure = new TextBlock
+            {
+                Text = name,
+                FontSize = PresetComboBox.FontSize,
+                FontFamily = PresetComboBox.FontFamily,
+                FontWeight = PresetComboBox.FontWeight,
+                FontStyle = PresetComboBox.FontStyle
+            };
+            measure.Measure(new Windows.Foundation.Size(double.PositiveInfinity, double.PositiveInfinity));
+
+            var leftOffset = PresetComboBox.Padding.Left + measure.DesiredSize.Width + 2;
+            PresetDirtyIndicator.Margin = new Thickness(leftOffset, 0, 0, 0);
+            PresetDirtyIndicator.Visibility = Visibility.Visible;
+        }
+        catch
+        {
+            PresetDirtyIndicator.Visibility = Visibility.Collapsed;
+            PresetSaveButton.Visibility = Visibility.Collapsed;
+        }
+    }
+
+    private void OnPresetComboPointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        PresetComboBox.BorderBrush = (Brush)Application.Current.Resources["ComboBoxBorderBrush"];
+        PresetComboBox.Background = (Brush)Application.Current.Resources["ComboBoxBackground"];
+    }
+
+    private void OnPresetComboPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        PresetComboBox.BorderBrush = new SolidColorBrush(Colors.Transparent);
+        PresetComboBox.Background = new SolidColorBrush(Colors.Transparent);
+    }
+
+    // ── Input Source selector (V7+ firmware) ──
+
+    private bool _isUpdatingSourceCombo;
+
+    private void RefreshSourceComboBox()
+    {
+        _isUpdatingSourceCombo = true;
+        try
+        {
+            bool show = ViewModel.IsDeviceConnected && ViewModel.InputSourceSupported;
+            SourceSection.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+            if (!show) return;
+
+            int target = (int)(byte)ViewModel.ActiveInputSource;
+            if (SourceComboBox.SelectedIndex != target)
+                SourceComboBox.SelectedIndex = target;
+        }
+        finally
+        {
+            _isUpdatingSourceCombo = false;
+        }
+    }
+
+    private async void OnSourceSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingSourceCombo) return;
+        if (!ViewModel.IsDeviceConnected || !ViewModel.InputSourceSupported) return;
+        if (SourceComboBox.SelectedItem is not ComboBoxItem item) return;
+
+        // Tag is "0" or "1" from XAML — parse to InputSource.
+        if (!byte.TryParse(item.Tag?.ToString(), out var raw)) return;
+        var target = (DSPiConsole.Usb.InputSource)raw;
+        if (target == ViewModel.ActiveInputSource) return;
+
+        await ViewModel.SetInputSourceAsync(target);
+    }
+
+    private void OnSourceComboPointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        SourceComboBox.BorderBrush = (Brush)Application.Current.Resources["ComboBoxBorderBrush"];
+        SourceComboBox.Background = (Brush)Application.Current.Resources["ComboBoxBackground"];
+    }
+
+    private void OnSourceComboPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        SourceComboBox.BorderBrush = new SolidColorBrush(Colors.Transparent);
+        SourceComboBox.Background = new SolidColorBrush(Colors.Transparent);
+    }
+
+    private bool _presetSwitchInProgress;
+
+    private async void OnPresetSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isUpdatingPresetCombo) return;
+        if (PresetComboBox.SelectedItem is not ComboBoxItem item || item.Tag is not int slot) return;
+
+        if (!ViewModel.IsDeviceConnected) return;
+
+        // Prevent re-entry: if a previous switch is mid-flight (dialog open or
+        // LoadPreset awaiting), ignore new selection changes. Without this, a
+        // second click can race the first and crash during the refresh.
+        if (_presetSwitchInProgress) { RevertPresetCombo(); return; }
+        _presetSwitchInProgress = true;
+        try
+        {
+            await PresetSwitchAsync(slot);
+        }
+        finally
+        {
+            _presetSwitchInProgress = false;
+        }
+    }
+
+    private async Task PresetSwitchAsync(int slot)
+    {
+
+        // If dirty, ask about unsaved changes
+        if (ViewModel.PresetsDirty && ViewModel.ActivePreset >= 0)
+        {
+            var summary = ViewModel.GetChangeSummary();
+            var message = summary != null
+                ? $"You have unsaved changes to the current preset:\n\n{summary}"
+                : "You have unsaved changes to the current preset.";
+
+            var dialog = new ContentDialog
+            {
+                Title = "Unsaved Changes",
+                Content = message,
+                PrimaryButtonText = "Save & Switch",
+                SecondaryButtonText = "Discard & Switch",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = Content.XamlRoot
+            };
+
+            var result = await dialog.ShowAsync();
+            if (result == ContentDialogResult.Primary)
+            {
+                // Save current preset first; prompt for a name if it's empty.
+                string? name = null;
+                if (!ViewModel.IsPresetOccupied(ViewModel.ActivePreset))
+                {
+                    name = await PromptForPresetNameAsync(ViewModel.ActivePreset);
+                    if (name == null) { RevertPresetCombo(); return; }
+                }
+                var saveResult = await ViewModel.SavePreset(ViewModel.ActivePreset, name);
+                if (saveResult != Usb.PresetResult.Ok)
+                {
+                    await ShowErrorDialog("Failed to save current preset");
+                    RevertPresetCombo();
+                    return;
+                }
+            }
+            else if (result == ContentDialogResult.None)
+            {
+                // Cancel — revert combo
+                RevertPresetCombo();
+                return;
+            }
+        }
+
+        // Load the selected preset
+        var loadResult = await ViewModel.LoadPreset(slot);
+        if (loadResult != Usb.PresetResult.Ok)
+        {
+            await ShowErrorDialog("Failed to load preset");
+            RevertPresetCombo();
+        }
+    }
+
+    private void RevertPresetCombo()
+    {
+        _isUpdatingPresetCombo = true;
+        if (ViewModel.ActivePreset >= 0 && ViewModel.ActivePreset < PresetComboBox.Items.Count)
+            PresetComboBox.SelectedIndex = ViewModel.ActivePreset;
+        else
+            PresetComboBox.SelectedIndex = -1;
+        _isUpdatingPresetCombo = false;
+    }
+
+    private async Task CopyPresetToSlot(int slot)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            await ShowErrorDialog("Not connected to device");
+            return;
+        }
+
+        string? name;
+        if (ViewModel.IsPresetOccupied(slot))
+        {
+            var confirm = new ContentDialog
+            {
+                Title = "Overwrite Preset",
+                Content = $"Overwrite \"{ViewModel.GetPresetName(slot)}\" with the current configuration?",
+                PrimaryButtonText = "Overwrite",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = Content.XamlRoot
+            };
+            if (await confirm.ShowAsync() != ContentDialogResult.Primary) return;
+            name = null; // keep existing name
+        }
+        else
+        {
+            name = await PromptForPresetNameAsync(slot);
+            if (name == null) return;
+        }
+
+        var result = await ViewModel.CopyToPreset(slot, name);
+        if (result != Usb.PresetResult.Ok)
+            await ShowErrorDialog("Failed to copy preset");
+    }
+
+    private void OnPresetComboRightTapped(object sender, RightTappedRoutedEventArgs e)
+    {
+        e.Handled = true;
+        var flyout = new MenuFlyout();
+
+        flyout.Items.Add(new MenuFlyoutItem
+        {
+            Text = "Save",
+            Icon = new FontIcon { Glyph = "\uE74E" }
+        });
+        ((MenuFlyoutItem)flyout.Items[0]).Click += async (s, _) => await QuickSavePreset();
+
+        // "Copy to..." submenu — writes the current configuration to another
+        // slot without changing the active preset. Disabled while dirty to
+        // avoid silently persisting unsaved changes into a second slot.
+        var copyToSub = new MenuFlyoutSubItem
+        {
+            Text = "Copy to...",
+            Icon = new FontIcon { Glyph = "" },
+            IsEnabled = !ViewModel.PresetsDirty
+        };
+        for (int i = 0; i < MainViewModel.PresetSlotCount; i++)
+        {
+            if (i == ViewModel.ActivePreset) continue;
+            int slot = i;
+            var item = new MenuFlyoutItem { Text = ViewModel.GetPresetDisplayName(slot) };
+            item.Click += async (s, _) => await CopyPresetToSlot(slot);
+            copyToSub.Items.Add(item);
+        }
+        flyout.Items.Add(copyToSub);
+
+        if (ViewModel.ActivePreset >= 0 && ViewModel.IsPresetOccupied(ViewModel.ActivePreset))
+        {
+            flyout.Items.Add(new MenuFlyoutItem
+            {
+                Text = "Reload",
+                Icon = new FontIcon { Glyph = "\uE72C" }
+            });
+            ((MenuFlyoutItem)flyout.Items[^1]).Click += async (s, _) =>
+            {
+                var result = await ViewModel.LoadPreset(ViewModel.ActivePreset);
+                if (result != Usb.PresetResult.Ok)
+                    await ShowErrorDialog("Failed to reload preset");
+            };
+
+            flyout.Items.Add(new MenuFlyoutItem
+            {
+                Text = "Rename...",
+                Icon = new FontIcon { Glyph = "\uE8AC" }
+            });
+            ((MenuFlyoutItem)flyout.Items[^1]).Click += async (s, _) => await ShowRenamePresetDialog(ViewModel.ActivePreset);
+
+            bool isAlreadyDefault = ViewModel.PresetStartupMode == 0 && ViewModel.PresetDefaultSlot == ViewModel.ActivePreset;
+            flyout.Items.Add(new MenuFlyoutItem
+            {
+                Text = "Set as Default",
+                Icon = new FontIcon { Glyph = "\uE735" },
+                IsEnabled = !isAlreadyDefault
+            });
+            ((MenuFlyoutItem)flyout.Items[^1]).Click += async (s, _) =>
+            {
+                await ViewModel.SetPresetStartup(0, (byte)ViewModel.ActivePreset);
+            };
+
+            flyout.Items.Add(new MenuFlyoutItem
+            {
+                Text = "Clear This Preset",
+                Icon = new FontIcon { Glyph = "\uE74D" }
+            });
+            ((MenuFlyoutItem)flyout.Items[^1]).Click += async (s, _) =>
+            {
+                var dialog = new ContentDialog
+                {
+                    Title = "Clear Preset",
+                    Content = $"Delete \"{ViewModel.GetPresetName(ViewModel.ActivePreset)}\"?",
+                    PrimaryButtonText = "Delete",
+                    CloseButtonText = "Cancel",
+                    DefaultButton = ContentDialogButton.Close,
+                    XamlRoot = Content.XamlRoot
+                };
+                if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+                {
+                    var result = await ViewModel.DeletePreset(ViewModel.ActivePreset);
+                    if (result != Usb.PresetResult.Ok)
+                        await ShowErrorDialog("Failed to delete preset");
+                }
+            };
+        }
+
+        flyout.Items.Add(new MenuFlyoutSeparator());
+
+        flyout.Items.Add(new MenuFlyoutItem
+        {
+            Text = "Clear All Presets",
+            Icon = new FontIcon { Glyph = "\uE750" }
+        });
+        ((MenuFlyoutItem)flyout.Items[^1]).Click += async (s, _) =>
+        {
+            var dialog = new ContentDialog
+            {
+                Title = "Clear All Presets",
+                Content = "Delete all presets from device flash? This cannot be undone.",
+                PrimaryButtonText = "Delete All",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = Content.XamlRoot
+            };
+            if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+            {
+                var result = await ViewModel.ClearAllPresets();
+                if (result != Usb.PresetResult.Ok)
+                    await ShowErrorDialog("Failed to clear presets");
+            }
+        };
+
+        flyout.ShowAt(PresetComboBox, new FlyoutShowOptions
+        {
+            Position = e.GetPosition(PresetComboBox)
+        });
+    }
+
+    private async Task QuickSavePreset()
+    {
+        if (!ViewModel.IsDeviceConnected) return;
+
+        if (ViewModel.ActivePreset >= 0)
+        {
+            // Quick-save to active slot. Empty slots have no stored name yet,
+            // so prompt the user to name it before writing.
+            string? name = null;
+            if (!ViewModel.IsPresetOccupied(ViewModel.ActivePreset))
+            {
+                name = await PromptForPresetNameAsync(ViewModel.ActivePreset);
+                if (name == null) return; // user cancelled
+            }
+            var result = await ViewModel.SavePreset(ViewModel.ActivePreset, name);
+            if (result != Usb.PresetResult.Ok)
+                await ShowErrorDialog("Failed to save preset");
+        }
+        else
+        {
+            // No active preset — show slot picker
+            await ShowSaveToSlotDialog();
+        }
+    }
+
+    /// <summary>
+    /// Prompt the user for a name when saving into an empty slot. Returns the
+    /// chosen name (or default fallback) on Save, or null if the user cancelled.
+    /// </summary>
+    private async Task<string?> PromptForPresetNameAsync(int slot)
+    {
+        var nameBox = new TextBox
+        {
+            PlaceholderText = $"Preset {slot + 1}",
+            MaxLength = 31
+        };
+
+        var dialog = new ContentDialog
+        {
+            Title = $"Name Preset {slot + 1}",
+            Content = nameBox,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return null;
+        return string.IsNullOrWhiteSpace(nameBox.Text) ? $"Preset {slot + 1}" : nameBox.Text.Trim();
+    }
+
+    private async Task SaveToPresetSlot(int slot)
+    {
+        // Prompt for name
+        var nameBox = new TextBox
+        {
+            PlaceholderText = $"Preset {slot + 1}",
+            MaxLength = 31,
+            Text = ViewModel.IsPresetOccupied(slot) ? ViewModel.GetPresetName(slot) : ""
+        };
+
+        var dialog = new ContentDialog
+        {
+            Title = $"Save to Preset {slot + 1}",
+            Content = nameBox,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            var name = string.IsNullOrWhiteSpace(nameBox.Text) ? $"Preset {slot + 1}" : nameBox.Text.Trim();
+            var result = await ViewModel.SavePreset(slot, name);
+            if (result != Usb.PresetResult.Ok)
+                await ShowErrorDialog("Failed to save preset");
+        }
+        else
+        {
+            RevertPresetCombo();
+        }
+    }
+
+    private async Task ShowSaveToSlotDialog()
+    {
+        var panel = new StackPanel { Spacing = 12 };
+
+        var slotCombo = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch };
+        for (int i = 0; i < MainViewModel.PresetSlotCount; i++)
+        {
+            slotCombo.Items.Add(new ComboBoxItem
+            {
+                Content = ViewModel.GetPresetDisplayName(i),
+                Tag = i
+            });
+        }
+        slotCombo.SelectedIndex = 0;
+
+        var nameBox = new TextBox
+        {
+            PlaceholderText = "Preset name",
+            MaxLength = 31
+        };
+
+        panel.Children.Add(new TextBlock { Text = "Save to slot:" });
+        panel.Children.Add(slotCombo);
+        panel.Children.Add(nameBox);
+
+        var dialog = new ContentDialog
+        {
+            Title = "Save Preset",
+            Content = panel,
+            PrimaryButtonText = "Save",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            if (slotCombo.SelectedItem is ComboBoxItem item && item.Tag is int slot)
+            {
+                var name = string.IsNullOrWhiteSpace(nameBox.Text) ? $"Preset {slot + 1}" : nameBox.Text.Trim();
+                var result = await ViewModel.SavePreset(slot, name);
+                if (result != Usb.PresetResult.Ok)
+                    await ShowErrorDialog("Failed to save preset");
+            }
+        }
+    }
+
+    private async Task ShowRenamePresetDialog(int slot)
+    {
+        var nameBox = new TextBox
+        {
+            Text = ViewModel.GetPresetName(slot),
+            MaxLength = 31
+        };
+        nameBox.SelectAll();
+
+        var dialog = new ContentDialog
+        {
+            Title = "Rename Preset",
+            Content = nameBox,
+            PrimaryButtonText = "Rename",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+        {
+            var name = nameBox.Text.Trim();
+            if (!string.IsNullOrEmpty(name))
+            {
+                var ok = await ViewModel.RenamePreset(slot, name);
+                if (!ok) await ShowErrorDialog("Failed to rename preset");
+            }
+        }
+    }
+
+    private void OnMainMenuOpening(object? sender, object e)
+    {
+        // "Save Master Volume" only applies when master volume is not stored
+        // per-preset. In with-preset mode, regular Save Preset already does it.
+        SaveMasterVolumeMenuItem.IsEnabled =
+            ViewModel.IsDeviceConnected && ViewModel.MasterVolumeMode == 0;
+    }
+
+    private async void OnSaveMasterVolumeClick(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            await ShowErrorDialog("Not connected to device");
+            return;
+        }
+        var status = await ViewModel.SaveMasterVolume();
+        if (status != 0)
+            await ShowErrorDialog($"Failed to save master volume (status 0x{status:X2})");
+    }
+
+    private async void OnSavePresetClick(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            await ShowErrorDialog("Not connected to device");
+            return;
+        }
+
+        if (ViewModel.PresetsSupported)
+        {
+            await QuickSavePreset();
+        }
+        else
+        {
+            // Legacy: fall back to SaveParams
+            var flashResult = await ViewModel.SaveParams();
+            if (flashResult == Usb.FlashResult.Ok)
+                await ShowSuccessDialog("Parameters saved successfully");
+            else
+                await ShowErrorDialog("Failed to save parameters");
+        }
+    }
+
+    private async void OnRevertPresetClick(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            await ShowErrorDialog("Not connected to device");
+            return;
+        }
+
+        if (ViewModel.PresetsSupported && ViewModel.ActivePreset >= 0)
+        {
+            var summary = ViewModel.GetChangeSummary();
+            var message = summary != null
+                ? $"Revert to saved \"{ViewModel.GetPresetName(ViewModel.ActivePreset)}\"?\n\nPending changes:\n{summary}"
+                : $"Revert to saved \"{ViewModel.GetPresetName(ViewModel.ActivePreset)}\"?";
+
+            var dialog = new ContentDialog
+            {
+                Title = "Revert Preset",
+                Content = message,
+                PrimaryButtonText = "Revert",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = Content.XamlRoot
+            };
+
+            if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+            {
+                var result = await ViewModel.LoadPreset(ViewModel.ActivePreset);
+                if (result != Usb.PresetResult.Ok)
+                    await ShowErrorDialog("Failed to revert preset");
+            }
+        }
+        else
+        {
+            // Legacy: fall back to LoadParams
+            var dialog = new ContentDialog
+            {
+                Title = "Revert to Saved",
+                Content = "Revert to last saved parameters?\n\nCurrent unsaved changes will be lost.",
+                PrimaryButtonText = "Revert",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary,
+                XamlRoot = Content.XamlRoot
+            };
+
+            if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+            {
+                var flashResult = await ViewModel.LoadParams();
+                switch (flashResult)
+                {
+                    case Usb.FlashResult.Ok:
+                        break;
+                    case Usb.FlashResult.ErrNoData:
+                        await ShowInfoDialog("No saved parameters found.\n\nThe device is using factory defaults.");
+                        break;
+                    default:
+                        await ShowErrorDialog("Failed to load parameters");
+                        break;
+                }
+            }
+        }
+    }
+
+    private async void OnAppWindowClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    {
+        if (_closeConfirmed) return;
+
+        if (!ViewModel.PresetsDirty || !ViewModel.IsDeviceConnected)
+            return;
+
+        args.Cancel = true;
+
+        var summary = ViewModel.GetChangeSummary();
+        var message = summary != null
+            ? $"You have unsaved changes:\n\n{summary}"
+            : "You have unsaved changes.";
+
+        var dialog = new ContentDialog
+        {
+            Title = "Unsaved Changes",
+            Content = message,
+            PrimaryButtonText = ViewModel.PresetsSupported && ViewModel.ActivePreset >= 0 ? "Save & Quit" : "Quit",
+            SecondaryButtonText = ViewModel.PresetsSupported && ViewModel.ActivePreset >= 0 ? "Discard & Quit" : null,
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary && ViewModel.PresetsSupported && ViewModel.ActivePreset >= 0)
+        {
+            string? name = null;
+            if (!ViewModel.IsPresetOccupied(ViewModel.ActivePreset))
+            {
+                name = await PromptForPresetNameAsync(ViewModel.ActivePreset);
+                if (name == null) return; // user cancelled — abort close
+            }
+            var saveResult = await ViewModel.SavePreset(ViewModel.ActivePreset, name);
+            if (saveResult != Usb.PresetResult.Ok)
+            {
+                await ShowErrorDialog("Failed to save preset. Close anyway?");
+            }
+            _closeConfirmed = true;
+            Close();
+        }
+        else if (result == ContentDialogResult.Primary || result == ContentDialogResult.Secondary)
+        {
+            _closeConfirmed = true;
+            Close();
+        }
+    }
+
+    #endregion
+
+    private async void OnFactoryResetClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Factory Reset",
+            Content = "Do you wish to clear all active parameters?\n\nThis will not overwrite your saved presets.",
+            PrimaryButtonText = "Reset",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            if (!ViewModel.IsDeviceConnected)
+            {
+                await ShowErrorDialog("Not connected to device");
+                return;
+            }
+
+            var flashResult = await ViewModel.FactoryResetParams();
+            if (flashResult == Usb.FlashResult.Ok)
+            {
+                await ShowSuccessDialog("Factory reset complete");
+            }
+            else
+            {
+                await ShowErrorDialog("Failed to reset parameters");
+            }
+        }
+    }
+
+    private async Task ShowSuccessDialog(string message)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Success",
+            Content = message,
+            CloseButtonText = "OK",
+            XamlRoot = Content.XamlRoot
+        };
+        await dialog.ShowAsync();
+    }
+
+    private async Task ShowErrorDialog(string message)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Error",
+            Content = message,
+            CloseButtonText = "OK",
+            XamlRoot = Content.XamlRoot
+        };
+        await dialog.ShowAsync();
+    }
+
+    private async Task ShowInfoDialog(string message)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Information",
+            Content = message,
+            CloseButtonText = "OK",
+            XamlRoot = Content.XamlRoot
+        };
+        await dialog.ShowAsync();
+    }
+
+    private void OnLoudnessClick(object sender, RoutedEventArgs e)
+    {
+        if (_loudnessWindow == null)
+        {
+            _loudnessWindow = new LoudnessWindow(ViewModel);
+            _loudnessWindow.Closed += (s, e) => _loudnessWindow = null;
+        }
+        _loudnessWindow.Activate();
+    }
+
+    private void OnCrossfeedClick(object sender, RoutedEventArgs e)
+    {
+        if (_crossfeedWindow == null)
+        {
+            _crossfeedWindow = new CrossfeedWindow(ViewModel);
+            _crossfeedWindow.Closed += (s, e) => _crossfeedWindow = null;
+        }
+        _crossfeedWindow.Activate();
+    }
+
+    private async void OnMatrixMixerClick(object sender, RoutedEventArgs e)
+    {
+        if (!ViewModel.IsDeviceConnected)
+        {
+            var dialog = new ContentDialog
+            {
+                Title = "Device Not Connected",
+                Content = "Please connect a DSPi device first.",
+                CloseButtonText = "OK",
+                XamlRoot = Content.XamlRoot
+            };
+            await dialog.ShowAsync();
+            return;
+        }
+
+        if (_matrixMixerWindow != null)
+        {
+            _matrixMixerWindow.Close();
+            return;
+        }
+
+        _matrixMixerWindow = new MatrixMixerWindow(ViewModel);
+        _matrixMixerWindow.Closed += (s, e) => { _matrixMixerWindow = null; UpdateShortcutIconStates(); };
+        _matrixMixerWindow.Activate();
+        UpdateShortcutIconStates();
+    }
+
+    private void OnStatsClick(object sender, RoutedEventArgs e)
+    {
+        if (_statsWindow != null)
+        {
+            _statsWindow.Close();
+            return;
+        }
+
+        _statsWindow = new StatsWindow(ViewModel.Device);
+        _statsWindow.Closed += (s, e) => { _statsWindow = null; UpdateShortcutIconStates(); };
+        _statsWindow.Activate();
+        UpdateShortcutIconStates();
+    }
+
+    private async void OnSettingsClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SettingsDialog(ViewModel) { XamlRoot = Content.XamlRoot };
+        await dialog.ShowAsync();
+    }
+
+    // Sidebar shortcut icon tap handlers
+
+    private void OnSidebarMatrixMixerTapped(object sender, TappedRoutedEventArgs e)
+    {
+        OnMatrixMixerClick(sender, new RoutedEventArgs());
+    }
+
+    private void OnSidebarSettingsTapped(object sender, TappedRoutedEventArgs e)
+    {
+        OnSettingsClick(sender, new RoutedEventArgs());
+    }
+
+    private void OnSidebarLoudnessTapped(object sender, TappedRoutedEventArgs e)
+    {
+        ViewModel.LoudnessEnabled = !ViewModel.LoudnessEnabled;
+    }
+
+    private void OnSidebarLoudnessRightClick(object sender, RightTappedRoutedEventArgs e)
+    {
+        OnLoudnessClick(sender, new RoutedEventArgs());
+        e.Handled = true;
+    }
+
+    private void OnSidebarCrossfeedTapped(object sender, TappedRoutedEventArgs e)
+    {
+        ViewModel.CrossfeedEnabled = !ViewModel.CrossfeedEnabled;
+    }
+
+    private void OnSidebarCrossfeedRightClick(object sender, RightTappedRoutedEventArgs e)
+    {
+        OnCrossfeedClick(sender, new RoutedEventArgs());
+        e.Handled = true;
+    }
+
+    private void OnSidebarLevellerTapped(object sender, TappedRoutedEventArgs e)
+    {
+        ViewModel.LevellerEnabled = !ViewModel.LevellerEnabled;
+    }
+
+    private void OnSidebarLevellerRightClick(object sender, RightTappedRoutedEventArgs e)
+    {
+        OpenLevellerWindow();
+        e.Handled = true;
+    }
+
+    private void OpenLevellerWindow()
+    {
+        if (_levellerWindow == null)
+        {
+            _levellerWindow = new VolumeLevellerWindow(ViewModel);
+            _levellerWindow.Closed += (s, e) => { _levellerWindow = null; UpdateShortcutIconStates(); };
+        }
+        _levellerWindow.Activate();
+        UpdateShortcutIconStates();
+    }
+
+    private void OnSidebarStatsTapped(object sender, TappedRoutedEventArgs e)
+    {
+        OnStatsClick(sender, new RoutedEventArgs());
+    }
+
+    private void OnSidebarBypassTapped(object sender, TappedRoutedEventArgs e)
+    {
+        ViewModel.Bypass = !ViewModel.Bypass;
+    }
+
+    // Shortcut icon illumination
+
+    private static readonly Windows.UI.Color _iconDimColor = Windows.UI.Color.FromArgb(0xFF, 0x88, 0x88, 0x88);
+    private static readonly Windows.UI.Color _iconHoverColor = Windows.UI.Color.FromArgb(0xFF, 0xBB, 0xBB, 0xBB);
+    private static readonly Windows.UI.Color _iconActiveColor = Windows.UI.Color.FromArgb(0xFF, 0xE0, 0xE0, 0xE0);
+    private static readonly Windows.UI.Color _iconBypassColor = Windows.UI.Color.FromArgb(0xFF, 0xF0, 0x50, 0x50);
+
+    private void UpdateShortcutIconStates()
+    {
+        DispatcherQueue.TryEnqueue(() =>
+        {
+            SetIconColor(MatrixMixerIcon, _matrixMixerWindow != null ? _iconActiveColor : _iconDimColor);
+            SetIconColor(SettingsIcon, _iconDimColor);
+            SetIconColor(LoudnessIcon, ViewModel.LoudnessEnabled ? _iconActiveColor : _iconDimColor);
+            SetIconColor(CrossfeedIcon, ViewModel.CrossfeedEnabled ? _iconActiveColor : _iconDimColor);
+            SetIconColor(LevellerIcon, ViewModel.LevellerEnabled ? _iconActiveColor : _iconDimColor);
+            SetIconColor(StatsIcon, _statsWindow != null ? _iconActiveColor : _iconDimColor);
+            SetIconColor(BypassIcon, ViewModel.Bypass ? _iconBypassColor : _iconDimColor);
+        });
+    }
+
+    private static void SetIconColor(FontIcon icon, Windows.UI.Color color)
+    {
+        icon.Foreground = new SolidColorBrush(color);
+    }
+
+    private bool IsShortcutIconActive(FontIcon icon)
+    {
+        if (icon == MatrixMixerIcon) return _matrixMixerWindow != null;
+        if (icon == LoudnessIcon) return ViewModel.LoudnessEnabled;
+        if (icon == CrossfeedIcon) return ViewModel.CrossfeedEnabled;
+        if (icon == LevellerIcon) return ViewModel.LevellerEnabled;
+        if (icon == StatsIcon) return _statsWindow != null;
+        if (icon == BypassIcon) return ViewModel.Bypass;
+        return false;
+    }
+
+    private FontIcon? GetIconFromBorder(object sender)
+    {
+        if (sender is Border border && border.Child is FontIcon icon)
+            return icon;
+        return null;
+    }
+
+    private void OnShortcutIconPointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        var icon = GetIconFromBorder(sender);
+        if (icon != null && !IsShortcutIconActive(icon))
+        {
+            AnimateIconForeground(icon, _iconHoverColor, TimeSpan.FromMilliseconds(150));
+        }
+    }
+
+    private void OnShortcutIconPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        var icon = GetIconFromBorder(sender);
+        if (icon != null && !IsShortcutIconActive(icon))
+        {
+            AnimateIconForeground(icon, _iconDimColor, TimeSpan.FromMilliseconds(200));
+        }
+    }
+
+    private void AnimateIconForeground(FontIcon icon, Windows.UI.Color targetColor, TimeSpan duration)
+    {
+        // Ensure icon has its own mutable brush instance for animation
+        if (icon.Foreground is not SolidColorBrush currentBrush || currentBrush.Dispatcher == null)
+        {
+            var existingColor = (icon.Foreground as SolidColorBrush)?.Color ?? _iconDimColor;
+            currentBrush = new SolidColorBrush(existingColor);
+            icon.Foreground = currentBrush;
+        }
+
+        var animation = new ColorAnimation
+        {
+            To = targetColor,
+            Duration = new Duration(duration),
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut }
+        };
+
+        var storyboard = new Storyboard();
+        storyboard.Children.Add(animation);
+        Storyboard.SetTarget(animation, currentBrush);
+        Storyboard.SetTargetProperty(animation, "Color");
+        storyboard.Begin();
+    }
+
+    private async void OnAutoEQUpdateClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Update AutoEQ Database",
+            Content = "Choose how to update the AutoEQ database:",
+            PrimaryButtonText = "Import File",
+            SecondaryButtonText = "Reset to Built-in",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Content.XamlRoot
+        };
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            // Import file
+            var picker = new FileOpenPicker();
+            picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+            picker.FileTypeFilter.Add(".json");
+
+            var hwnd = WindowNative.GetWindowHandle(this);
+            InitializeWithWindow.Initialize(picker, hwnd);
+
+            var file = await picker.PickSingleFileAsync();
+            if (file != null)
+            {
+                try
+                {
+                    var json = await Windows.Storage.FileIO.ReadTextAsync(file);
+                    // Validate by attempting to deserialize
+                    var testParse = System.Text.Json.JsonSerializer.Deserialize<AutoEQDatabase>(json, new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                    if (testParse?.Entries == null || testParse.Entries.Count == 0)
+                    {
+                        await ShowErrorDialog("Invalid database file: no entries found.");
+                        return;
+                    }
+
+                    var appDataPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DSPiConsole");
+                    Directory.CreateDirectory(appDataPath);
+                    var destPath = System.IO.Path.Combine(appDataPath, "autoeq_database.json");
+                    File.WriteAllText(destPath, json);
+
+                    AutoEQManager.Instance.LoadFromJson(json);
+                    RefreshAutoEQFavoritesMenu();
+                    await ShowSuccessDialog($"Database imported: {testParse.Entries.Count} entries loaded.");
+                }
+                catch (Exception ex)
+                {
+                    await ShowErrorDialog($"Failed to import database: {ex.Message}");
+                }
+            }
+        }
+        else if (result == ContentDialogResult.Secondary)
+        {
+            // Reset to built-in
+            var appDataPath = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DSPiConsole");
+            var userDbPath = System.IO.Path.Combine(appDataPath, "autoeq_database.json");
+            if (File.Exists(userDbPath))
+            {
+                File.Delete(userDbPath);
+            }
+            await AutoEQManager.Instance.LoadDatabaseAsync();
+            RefreshAutoEQFavoritesMenu();
+            await ShowSuccessDialog("Database reset to built-in version.");
+        }
+    }
+
+    private async void OnUpdateFirmwareClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new ContentDialog
+        {
+            Title = "Firmware Update",
+            Content = "This will reboot the device into bootloader mode.\n\nAudio output will stop immediately. The device will appear as a USB drive to which you can drag a .uf2 firmware file.",
+            PrimaryButtonText = "Reboot into Bootloader",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Close,
+            XamlRoot = Content.XamlRoot
+        };
+
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+        if (!ViewModel.IsDeviceConnected) return;
+
+        _ = Task.Run(() => ViewModel.Device.EnterBootloaderMode());
+    }
+
+    private void OnExitClick(object sender, RoutedEventArgs e)
+    {
+        Close();
+    }
+
+    #endregion
+
+    #region Import/Export Handlers
+
+    private async void OnImportFiltersClick(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileOpenPicker();
+        picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+        picker.FileTypeFilter.Add(".txt");
+
+        var hwnd = WindowNative.GetWindowHandle(this);
+        InitializeWithWindow.Initialize(picker, hwnd);
+
+        var file = await picker.PickSingleFileAsync();
+        if (file == null) return;
+
+        try
+        {
+            var contents = await Windows.Storage.FileIO.ReadTextAsync(file);
+            var result = FilterFileService.ParseFile(contents);
+
+            if (result.Format == FilterFileFormat.Unknown)
+            {
+                await ShowErrorDialog("Could not parse filter file. Unsupported format.");
+                return;
+            }
+
+            if (result.Format == FilterFileFormat.DSPiConsole && result.ChannelFilters != null)
+            {
+                await ImportMultiChannelFilters(result.ChannelFilters);
+            }
+            else if (result.Format == FilterFileFormat.REW && result.SingleChannelFilters != null)
+            {
+                await ImportSingleChannelFilters(result.SingleChannelFilters);
+            }
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorDialog($"Failed to read file: {ex.Message}");
+        }
+    }
+
+    private async Task ImportSingleChannelFilters(List<FilterParams> filters)
+    {
+        var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
+        dialog.ConfigureForSingleChannel(filters.Count, ViewModel.ActiveOutputs, ViewModel.IsOutputEnabled);
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            dialog.CollectSelectedChannels();
+            foreach (var channelId in dialog.SelectedChannelIds)
+            {
+                if (!await ApplyFiltersToChannel(channelId, filters))
+                {
+                    await ShowErrorDialog("Communication Failure - Unable to perform operation");
+                    return;
+                }
+            }
+
+            if (dialog.SelectedChannelIds.Count > 0)
+            {
+                await ShowSuccessDialog($"Filters imported to {dialog.SelectedChannelIds.Count} channel(s)");
+            }
+        }
+    }
+
+    private async Task ImportMultiChannelFilters(Dictionary<int, List<FilterParams>> channelFilters)
+    {
+        var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
+        dialog.ConfigureForMultiChannel(channelFilters.Keys, ViewModel.ActiveOutputs, ViewModel.IsOutputEnabled);
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+        {
+            dialog.CollectSelectedChannels();
+            foreach (var channelId in dialog.SelectedChannelIds)
+            {
+                if (channelFilters.TryGetValue(channelId, out var filters))
+                {
+                    if (!await ApplyFiltersToChannel(channelId, filters))
+                    {
+                        await ShowErrorDialog("Communication Failure - Unable to perform operation");
+                        return;
+                    }
+                }
+            }
+
+            if (dialog.SelectedChannelIds.Count > 0)
+            {
+                await ShowSuccessDialog("Filters imported successfully");
+            }
+        }
+    }
+
+    private async Task<bool> ApplyFiltersToChannel(int channelId, List<FilterParams> filters)
+    {
+        var channel = Channel.All.FirstOrDefault(c => (int)c.Id == channelId);
+        if (channel == null) return false;
+
+        var bandCount = channel.BandCount;
+
+        // Apply imported filters
+        for (int i = 0; i < Math.Min(filters.Count, bandCount); i++)
+        {
+            if (!await SetFilterWithRetry(channelId, i, filters[i].Clone()))
+                return false;
+        }
+
+        // Clear remaining bands
+        for (int i = filters.Count; i < bandCount; i++)
+        {
+            if (!await SetFilterWithRetry(channelId, i, new FilterParams(FilterType.Flat, 1000, 0.707f, 0)))
+                return false;
+        }
+
+        return true;
+    }
+
+    private async Task<bool> SetFilterWithRetry(int channelId, int band, FilterParams p)
+    {
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            if (await ViewModel.SetFilter(channelId, band, p))
+                return true;
+        }
+        return false;
+    }
+
+    private async void OnExportFiltersClick(object sender, RoutedEventArgs e)
+    {
+        var picker = new FileSavePicker();
+        picker.SuggestedStartLocation = PickerLocationId.DocumentsLibrary;
+        picker.SuggestedFileName = "DSPi Filters";
+        picker.FileTypeChoices.Add("Text Files", new List<string> { ".txt" });
+
+        var hwnd = WindowNative.GetWindowHandle(this);
+        InitializeWithWindow.Initialize(picker, hwnd);
+
+        var file = await picker.PickSaveFileAsync();
+        if (file == null) return;
+
+        try
+        {
+            // Build channel data dictionary
+            var channelData = new Dictionary<int, IReadOnlyList<FilterParams>>();
+            foreach (var channel in Channel.All)
+            {
+                var filters = ViewModel.GetFilters(channel);
+                channelData[(int)channel.Id] = filters.ToList();
+            }
+
+            var output = FilterFileService.GenerateExportString(channelData);
+            await Windows.Storage.FileIO.WriteTextAsync(file, output);
+            await ShowSuccessDialog("Filters exported successfully");
+        }
+        catch (Exception ex)
+        {
+            await ShowErrorDialog($"Failed to write file: {ex.Message}");
+        }
+    }
+
+    #endregion
+
+    #region AutoEQ Handlers
+
+    private async void OnAutoEQBrowseClick(object sender, RoutedEventArgs e)
+    {
+        // Ensure database is loaded
+        if (!AutoEQManager.Instance.IsLoaded)
+        {
+            await AutoEQManager.Instance.LoadDatabaseAsync();
+        }
+
+        if (!AutoEQManager.Instance.IsLoaded)
+        {
+            await ShowErrorDialog(AutoEQManager.Instance.ErrorMessage ?? "Failed to load AutoEQ database");
+            return;
+        }
+
+        var dialog = new AutoEQBrowserDialog { XamlRoot = Content.XamlRoot };
+        var result = await dialog.ShowAsync();
+
+        // Always refresh favorites menu after dialog closes (user may have added/removed favorites)
+        RefreshAutoEQFavoritesMenu();
+
+        if (result == ContentDialogResult.Primary && dialog.SelectedProfile != null)
+        {
+            if (!await ApplyAutoEQProfile(dialog.SelectedProfile))
+            {
+                await ShowErrorDialog("Communication Failure - Unable to perform operation");
+                return;
+            }
+            await ShowSuccessDialog($"Applied profile: {dialog.SelectedProfile.DisplayName}");
+        }
+    }
+
+    private async Task<bool> ApplyAutoEQProfile(HeadphoneEntry profile)
+    {
+        var filters = AutoEQManager.ConvertFilters(profile);
+
+        var dialog = new ChannelSelectionDialog { XamlRoot = Content.XamlRoot };
+        dialog.ConfigureForAutoEQ(
+            filters.Count,
+            ViewModel.ActiveOutputs,
+            ViewModel.IsOutputEnabled,
+            ch => ViewModel.GetChannelName(ch));
+
+        var result = await dialog.ShowAsync();
+        if (result != ContentDialogResult.Primary) return true; // user cancelled
+
+        dialog.CollectSelectedChannels();
+        if (dialog.SelectedChannelIds.Count == 0) return true;
+
+        // Set preamp only after user confirms
+        // Apply profile preamp to both input channels (AutoEQ preamp is a
+        // global headroom compensation, applied pre-EQ).
+        ViewModel.InputPreampLDb = (float)profile.Preamp;
+        ViewModel.InputPreampRDb = (float)profile.Preamp;
+
+        // Apply filters to each selected channel
+        foreach (var channelId in dialog.SelectedChannelIds)
+        {
+            if (!await ApplyFiltersToChannel(channelId, filters))
+                return false;
+        }
+
+        // Refresh editor if selected channel was affected
+        if (_selectedChannel != null &&
+            dialog.SelectedChannelIds.Contains((int)_selectedChannel.Id))
+            ShowChannelEditor(_selectedChannel);
+
+        return true;
+    }
+
+    private void RefreshAutoEQFavoritesMenu()
+    {
+        PopulateFavoritesMenu(AutoEQFavoritesMenu);
+    }
+
+    private void PopulateFavoritesMenu(MenuFlyoutSubItem menu)
+    {
+        menu.Items.Clear();
+
+        var favorites = AutoEQManager.Instance.Favorites;
+        if (favorites.Count == 0)
+        {
+            var emptyItem = new MenuFlyoutItem
+            {
+                Text = "No favorites yet",
+                IsEnabled = false
+            };
+            menu.Items.Add(emptyItem);
+        }
+        else
+        {
+            foreach (var entry in favorites)
+            {
+                var item = new MenuFlyoutItem { Text = entry.DisplayName, Tag = entry };
+                item.Click += OnAutoEQFavoriteClick;
+                menu.Items.Add(item);
+            }
+
+            menu.Items.Add(new MenuFlyoutSeparator());
+
+            var clearItem = new MenuFlyoutItem { Text = "Clear Favorites" };
+            clearItem.Click += async (s, e) =>
+            {
+                var dialog = new ContentDialog
+                {
+                    Title = "Clear Favorites",
+                    Content = "Are you sure you want to clear all AutoEQ favorites?",
+                    PrimaryButtonText = "Clear",
+                    CloseButtonText = "Cancel",
+                    DefaultButton = ContentDialogButton.Close,
+                    XamlRoot = Content.XamlRoot
+                };
+
+                if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+                {
+                    AutoEQManager.Instance.ClearFavorites();
+                    RefreshAutoEQFavoritesMenu();
+                }
+            };
+            menu.Items.Add(clearItem);
+        }
+    }
+
+    private async void OnAutoEQFavoriteClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuFlyoutItem item && item.Tag is HeadphoneEntry profile)
+        {
+            if (!await ApplyAutoEQProfile(profile))
+            {
+                await ShowErrorDialog("Communication Failure - Unable to perform operation");
+                return;
+            }
+            await ShowSuccessDialog($"Applied profile: {profile.DisplayName}");
+        }
+    }
+
+    #endregion
+
+    #region Graph Resize
+
+    private RowDefinition GraphRow => ContentGrid.RowDefinitions[0];
+
+    private void OnGraphGripperPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        if (sender is UIElement el)
+        {
+            _isResizingGraph = true;
+            _graphResizeStartY = e.GetCurrentPoint(ContentGrid).Position.Y;
+            _graphResizeStartHeight = GraphRow.Height.Value;
+            el.CapturePointer(e.Pointer);
+            e.Handled = true;
+        }
+    }
+
+    private void OnGraphGripperPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_isResizingGraph) return;
+        var delta = e.GetCurrentPoint(ContentGrid).Position.Y - _graphResizeStartY;
+        var newHeight = Math.Clamp(_graphResizeStartHeight + delta, GraphMinHeight, GraphMaxHeight);
+        GraphRow.Height = new GridLength(newHeight);
+        e.Handled = true;
+    }
+
+    private void OnGraphGripperPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_isResizingGraph) return;
+        _isResizingGraph = false;
+        if (sender is UIElement el)
+            el.ReleasePointerCapture(e.Pointer);
+        e.Handled = true;
+    }
+
+    #endregion
+
+    #region Graph Popout
+
+    private DispatcherTimer? _popoutFadeTimer;
+    private double _popoutFadeTarget;
+
+    private void OnGraphAreaPointerEntered(object sender, PointerRoutedEventArgs e)
+    {
+        GraphPopoutButton.IsHitTestVisible = true;
+        FadePopoutButton(0.6);
+    }
+
+    private void OnGraphAreaPointerExited(object sender, PointerRoutedEventArgs e)
+    {
+        GraphPopoutButton.IsHitTestVisible = false;
+        FadePopoutButton(0);
+    }
+
+    private void FadePopoutButton(double target)
+    {
+        _popoutFadeTarget = target;
+        if (_popoutFadeTimer == null)
+        {
+            _popoutFadeTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+            _popoutFadeTimer.Tick += (_, _) =>
+            {
+                double diff = _popoutFadeTarget - GraphPopoutButton.Opacity;
+                if (Math.Abs(diff) < 0.02)
+                {
+                    GraphPopoutButton.Opacity = _popoutFadeTarget;
+                    _popoutFadeTimer.Stop();
+                }
+                else
+                {
+                    GraphPopoutButton.Opacity += diff * 0.25;
+                }
+            };
+        }
+        _popoutFadeTimer.Start();
+    }
+
+    private void OnGraphPopoutClick(object sender, RoutedEventArgs e)
+    {
+        if (_graphWindow != null)
+        {
+            _graphWindow.Activate();
+            return;
+        }
+
+        // Animate graph row collapsing
+        GraphGripperControl.Visibility = Visibility.Collapsed;
+        LegendPanel.Visibility = Visibility.Collapsed;
+        AnimateGraphRow(GraphRow.Height.Value, 0, 250, () =>
+        {
+            GraphArea.Visibility = Visibility.Collapsed;
+            GraphRow.Height = GridLength.Auto;
+        });
+
+        // Open popout window
+        _graphWindow = new GraphWindow(ViewModel);
+        bool follows = AppSettings.Instance.PopoutFollowsSelectedChannel;
+        _graphWindow.SetIgnoreVisibility(!follows);
+        if (_selectedChannel != null && follows)
+            _graphWindow.SetSelectedChannel((int)_selectedChannel.Id);
+        _graphWindow.Closed += (_, _) =>
+        {
+            _graphWindow = null;
+
+            // Restore and animate graph row expanding
+            GraphArea.Visibility = Visibility.Visible;
+            GraphArea.Opacity = 0;
+            LegendPanel.Visibility = Visibility.Visible;
+            LegendPanel.Opacity = 0;
+            GraphRow.Height = new GridLength(0);
+
+            AnimateGraphRow(0, 250, 300, () =>
+            {
+                GraphGripperControl.Visibility = Visibility.Visible;
+                GraphArea.Opacity = 1;
+                LegendPanel.Opacity = 1;
+            });
+        };
+        _graphWindow.Activate();
+    }
+
+    private void AnimateGraphRow(double from, double to, int durationMs, Action? onComplete = null)
+    {
+        const int frameMs = 16;
+        int totalFrames = Math.Max(1, durationMs / frameMs);
+        int frame = 0;
+
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(frameMs) };
+        timer.Tick += (_, _) =>
+        {
+            frame++;
+            double t = Math.Min(1.0, (double)frame / totalFrames);
+            // Ease out cubic
+            double eased = 1.0 - Math.Pow(1.0 - t, 3);
+            double height = from + (to - from) * eased;
+            GraphRow.Height = new GridLength(Math.Max(0, height));
+
+            // Fade graph area and legend proportionally
+            double opacity = to > from ? eased : 1.0 - eased;
+            GraphArea.Opacity = opacity;
+            LegendPanel.Opacity = opacity;
+
+            if (t >= 1.0)
+            {
+                timer.Stop();
+                onComplete?.Invoke();
+            }
+        };
+        timer.Start();
+    }
+
+    #endregion
+
+    #region Title Bar
+
+    private void UpdateTitleBarDragRegion()
+    {
+        var scale = AppTitleBar.XamlRoot?.RasterizationScale ?? 1.0;
+        var buttonPos = TitleBarMenuButton.TransformToVisual(AppTitleBar).TransformPoint(new Windows.Foundation.Point(0, 0));
+
+        int titleBarWidth = (int)(AppTitleBar.ActualWidth * scale);
+        int titleBarHeight = (int)(AppTitleBar.ActualHeight * scale);
+        int btnX = (int)(buttonPos.X * scale);
+        int btnW = (int)(TitleBarMenuButton.ActualWidth * scale);
+
+        // Two drag rectangles: left of button and right of button
+        var left = new Windows.Graphics.RectInt32(0, 0, btnX, titleBarHeight);
+        var right = new Windows.Graphics.RectInt32(btnX + btnW, 0, titleBarWidth - btnX - btnW, titleBarHeight);
+
+        var nonClientInput = Microsoft.UI.Input.InputNonClientPointerSource.GetForWindowId(
+            Microsoft.UI.Win32Interop.GetWindowIdFromWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)));
+        nonClientInput.SetRegionRects(Microsoft.UI.Input.NonClientRegionKind.Passthrough,
+            new[] { new Windows.Graphics.RectInt32(btnX, (int)(buttonPos.Y * scale), btnW, (int)(TitleBarMenuButton.ActualHeight * scale)) });
+    }
+
+    #endregion
+}

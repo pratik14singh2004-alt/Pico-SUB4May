@@ -231,7 +231,8 @@ public static class PresetResult
 public enum OutputSlotType : byte
 {
     Spdif = 0,
-    I2S = 1
+    I2S = 1,
+    Pdm = 2
 }
 
 /// <summary>

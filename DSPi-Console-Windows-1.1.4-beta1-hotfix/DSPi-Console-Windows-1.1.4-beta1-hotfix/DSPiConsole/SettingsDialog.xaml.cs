@@ -503,9 +503,11 @@ public sealed partial class SettingsDialog : ContentDialog
         }
         else
         {
-            typePicker.Items.Add(new ComboBoxItem { Content = "PDM" });
+            typePicker.Items.Add(new ComboBoxItem { Content = "PDM", Tag = OutputSlotType.Pdm });
+            typePicker.Items.Add(new ComboBoxItem { Content = "S/PDIF", Tag = OutputSlotType.Spdif });
             typePicker.SelectedIndex = 0;
-            typePicker.IsEnabled = false;
+            typePicker.Tag = output;
+            typePicker.SelectionChanged += OnPdmTypeChanged;
         }
         Grid.SetColumn(typePicker, 2);
         row.Children.Add(typePicker);
@@ -579,6 +581,31 @@ public sealed partial class SettingsDialog : ContentDialog
         // Revert on error
         _suppressSelectionChanged = true;
         combo.SelectedIndex = _vm.GetOutputSlotType(output.SlotIndex) == OutputSlotType.I2S ? 1 : 0;
+        _suppressSelectionChanged = false;
+        ShowStatus(GetI2SErrorMessage(status, output.Name), isError: true);
+    }
+
+    private async void OnPdmTypeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressSelectionChanged) return;
+        if (sender is not ComboBox combo || combo.Tag is not PinOutput output) return;
+        if (combo.SelectedItem is not ComboBoxItem item || item.Tag is not OutputSlotType newType) return;
+
+        ClearStatus();
+
+        const int PdmSlot = 2;
+        var status = await Task.Run(() => _vm.SetOutputSlotType(PdmSlot, newType));
+
+        if (status == PinConfigResult.Success)
+        {
+            string typeName = newType == OutputSlotType.Spdif ? "S/PDIF" : "PDM";
+            ShowStatus($"{output.Name} → {typeName}", isError: false);
+            return;
+        }
+
+        // Revert on error
+        _suppressSelectionChanged = true;
+        combo.SelectedIndex = newType == OutputSlotType.Spdif ? 0 : 1;
         _suppressSelectionChanged = false;
         ShowStatus(GetI2SErrorMessage(status, output.Name), isError: true);
     }

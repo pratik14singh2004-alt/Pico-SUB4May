@@ -1,0 +1,62 @@
+// ============================================================
+// PATCH for firmware/DSPi/main.c
+// Change: For RP2040, remove PDM init; Core 1 is always
+//         EQ-worker or idle (no PDM mode).
+// ============================================================
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 1: core0_init() — remove PDM init block
+// ──────────────────────────────────────────────────────────────
+// FIND AND DELETE this block entirely:
+//
+// #if ENABLE_SUB
+//     {
+//         extern uint8_t output_pins[];
+//         pdm_setup_hw(output_pins[NUM_PIN_OUTPUTS - 1]);
+//     }
+//     if (matrix_mixer.outputs[NUM_OUTPUT_CHANNELS - 1].enabled) {
+//         core1_mode = CORE1_MODE_PDM;
+//         pdm_set_enabled(true);
+//     } else {
+//         bool any_eq_output = false;
+//         for (int i = CORE1_EQ_FIRST_OUTPUT; i <= CORE1_EQ_LAST_OUTPUT; i++) {
+//             if (matrix_mixer.outputs[i].enabled) { any_eq_output = true; break; }
+//         }
+//         core1_mode = any_eq_output ? CORE1_MODE_EQ_WORKER : CORE1_MODE_IDLE;
+//         pdm_set_enabled(false);
+//     }
+//     multicore_launch_core1(pdm_core1_entry);
+// #endif
+//
+// REPLACE WITH (always launch core1 as EQ-worker or idle):
+//
+// #if !PICO_RP2350
+//     // RP2040: No PDM. Core 1 handles EQ for SPDIF 2 outputs if needed.
+//     {
+//         bool any_eq_output = false;
+//         for (int i = CORE1_EQ_FIRST_OUTPUT; i <= CORE1_EQ_LAST_OUTPUT; i++) {
+//             if (matrix_mixer.outputs[i].enabled) { any_eq_output = true; break; }
+//         }
+//         core1_mode = any_eq_output ? CORE1_MODE_EQ_WORKER : CORE1_MODE_IDLE;
+//     }
+//     multicore_launch_core1(pdm_core1_entry); // pdm_core1_entry handles CORE1_MODE_EQ_WORKER too
+// #endif
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 2: Remove #include "pdm_generator.h" for RP2040
+// ──────────────────────────────────────────────────────────────
+// Wrap the pdm_generator include:
+//
+// #if ENABLE_SUB
+// #include "pdm_generator.h"
+// #endif
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 3: derive_core1_mode() — remove PDM mode check
+// ──────────────────────────────────────────────────────────────
+// FIND any code like:
+//   if (matrix_mixer.outputs[NUM_OUTPUT_CHANNELS - 1].enabled)
+//       return CORE1_MODE_PDM;
+//
+// For RP2040, this should be wrapped in #if ENABLE_SUB / #endif
+// so it doesn't trigger when ENABLE_SUB = 0.

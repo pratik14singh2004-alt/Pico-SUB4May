@@ -1,0 +1,95 @@
+================================================================
+HOW TO BUILD: DSPi-RP2040-spdif-sub.uf2
+(S/PDIF on GPIO 10 instead of PDM for RP2040)
+================================================================
+
+WHAT THIS PATCH DOES
+--------------------
+- GPIO 10 now outputs S/PDIF (stereo, mono sub signal on both L+R)
+  instead of PDM 1-bit bitstream.
+- S/PDIF 3 is a new output slot (slot index 2 on RP2040).
+- The matrix mixer column 4 ("SUB OUT") feeds SPDIF 3.
+- The app's "SUB OUT → S/PDIF" now succeeds (no more "Invalid slot" error).
+- PDM is disabled on RP2040; RP2350 is unchanged.
+
+STEP 1: Install toolchain (Windows + WSL recommended)
+------------------------------------------------------
+Open WSL (Ubuntu) terminal and run:
+
+  sudo apt update
+  sudo apt install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
+                      libstdc++-arm-none-eabi-newlib build-essential git python3
+
+STEP 2: Clone the firmware repo with submodules
+------------------------------------------------------
+  git clone --recurse-submodules https://github.com/WeebLabs/DSPi
+  cd DSPi/firmware
+
+STEP 3: Apply the changes
+------------------------------------------------------
+Edit firmware/DSPi/config.h:
+  - See config.h.patch for exact changes.
+  - Key: add `#define PICO_SPDIF_PIN_3 10` for non-RP2350.
+  - Key: change NUM_SPDIF_INSTANCES to 3 for RP2040.
+  - Key: set ENABLE_SUB to 0 for RP2040.
+  - Key: NUM_PIN_OUTPUTS = 3 for RP2040.
+
+Edit firmware/DSPi/usb_audio.c:
+  - See usb_audio.patch for exact changes.
+  - Change output_pins[] from {6, 7, 10(PDM)} to {6, 7, 10(SPDIF3)}.
+  - Add SPDIF3 instance init in usb_sound_card_init().
+  - Replace pdm_push_sample() with SPDIF3 buffer feeding code.
+
+Edit firmware/DSPi/main.c:
+  - See main.patch for exact changes.
+  - Wrap PDM init in #if ENABLE_SUB / #endif.
+  - Remove PDM core1 mode for RP2040.
+
+Edit firmware/DSPi/CMakeLists.txt:
+  - See CMakeLists.patch for exact changes.
+  - Wrap pdm_generator.c in rp2350-only conditional.
+
+STEP 4: Build
+------------------------------------------------------
+  cd /path/to/DSPi/firmware
+  cmake -DPICO_BOARD=pico -B build
+  cd build
+  make -j4
+
+  The output will be: build/DSPi/DSPi.uf2
+
+STEP 5: Rename and flash
+------------------------------------------------------
+  cp build/DSPi/DSPi.uf2 DSPi-RP2040-spdif-sub-v1.1.4.uf2
+
+  To flash:
+  1. Hold BOOTSEL button on Pico while plugging USB.
+  2. It appears as a USB drive (RPI-RP2).
+  3. Copy DSPi-RP2040-spdif-sub-v1.1.4.uf2 to that drive.
+  4. Pico reboots automatically.
+
+STEP 6: Use in the app
+------------------------------------------------------
+  - In Settings → Hardware: SUB OUT dropdown → select "S/PDIF".
+    This now succeeds (slot 2 is valid).
+  - In Matrix Mixer: route your sub signal to the SPDIF 2/3
+    columns (matrix output 4). Set gain and enable.
+  - GPIO 10 will output S/PDIF. Connect to your S/PDIF receiver/amp.
+
+TROUBLESHOOTING
+------------------------------------------------------
+  - If SPDIF3 sounds distorted: the Q28→int16 scaling in usb_audio.c
+    may need adjustment. Try changing `>> 12` to `>> 13`.
+  - If no output: check audio_spdif_set_enabled() is called for slot 2.
+  - If app says "firmware mismatch": the bulk params format is unchanged,
+    so the existing app (v1.1.4) is fully compatible.
+
+ALTERNATIVE (no build required)
+------------------------------------------------------
+  If you don't want to build, use the app-level workaround already
+  implemented in SettingsDialog.xaml.cs:
+  - In Settings → Hardware: select "S/PDIF" for SUB OUT.
+  - This automatically reassigns OUT 3/4 (SPDIF 2) to GPIO 10.
+  - Then route your sub audio to SPDIF 2 L/R in the Matrix Mixer.
+  - Connect sub circuit to GPIO 10 (which now carries SPDIF 2 signal).
+  - This works WITHOUT any firmware changes.

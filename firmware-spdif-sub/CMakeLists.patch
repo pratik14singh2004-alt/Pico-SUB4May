@@ -1,0 +1,72 @@
+# ============================================================
+# PATCH for firmware/DSPi/CMakeLists.txt
+# Change: Remove pdm_generator.c for RP2040 build
+# ============================================================
+
+# FIND this in add_executable(DSPi ...):
+#   pdm_generator.c
+#   pdm_generator.h
+#
+# REPLACE WITH (conditional):
+#   $<$<STREQUAL:${PICO_PLATFORM},rp2350>:pdm_generator.c>
+#   $<$<STREQUAL:${PICO_PLATFORM},rp2350>:pdm_generator.h>
+#
+# OR simpler — just remove those two lines from add_executable
+# and add a platform guard:
+
+# After add_executable, add:
+# if (PICO_PLATFORM STREQUAL "rp2350")
+#     target_sources(DSPi PRIVATE pdm_generator.c pdm_generator.h)
+# endif()
+
+# The target_link_libraries block is UNCHANGED — pico_audio_spdif_multi
+# is already linked and will support 3 instances on RP2040.
+
+# Full corrected CMakeLists.txt:
+# --------------------------------
+# add_executable(DSPi
+#     bulk_params.c
+#     bulk_params.h
+#     config.h
+#     crossfeed.c
+#     crossfeed.h
+#     dcp_inline.h
+#     dsp_pipeline.c
+#     dsp_pipeline.h
+#     flash_clkdiv.c
+#     flash_clkdiv.h
+#     flash_storage.c
+#     flash_storage.h
+#     leveller.c
+#     leveller.h
+#     loudness.c
+#     loudness.h
+#     main.c
+#     usb_audio.c
+#     usb_audio.h
+#     usb_descriptors.c
+#     usb_descriptors.h
+#     usb_feedback_controller.c
+#     usb_feedback_controller.h
+# )
+#
+# # pdm_generator only needed for RP2350 (RP2040 uses SPDIF 3 instead)
+# if (PICO_PLATFORM STREQUAL "rp2350")
+#     target_sources(DSPi PRIVATE pdm_generator.c pdm_generator.h)
+# endif()
+#
+# if (PICO_PLATFORM STREQUAL "rp2040")
+#     target_sources(DSPi PRIVATE dsp_process_rp2040.S)
+# endif()
+#
+# target_link_libraries(DSPi
+#     pico_stdlib
+#     pico_multicore
+#     pico_unique_id
+#     hardware_pwm
+#     hardware_flash
+#     hardware_adc
+#     pico_audio_spdif_multi
+#     pico_audio_i2s_multi
+#     usb_device
+# )

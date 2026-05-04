@@ -1,0 +1,104 @@
+// ============================================================
+// PATCH for firmware/DSPi/usb_audio.c
+// Change: Wire up SPDIF 3 instance; replace pdm_push_sample
+//         with SPDIF 3 buffer feeding for RP2040.
+// ============================================================
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 1: output_pins[] array
+// ──────────────────────────────────────────────────────────────
+// FIND:
+//   #else
+//   uint8_t output_pins[NUM_PIN_OUTPUTS] = {
+//       PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
+//   };
+//
+// REPLACE WITH:
+//   #else
+//   uint8_t output_pins[NUM_PIN_OUTPUTS] = {
+//       PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2, PICO_SPDIF_PIN_3
+//   };
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 2: usb_sound_card_init() — add SPDIF 3 instance
+// ──────────────────────────────────────────────────────────────
+// After the code that sets up spdif_instance_ptrs[1] (SPDIF 2),
+// add the following block for SPDIF 3:
+//
+// #if !PICO_RP2350
+//   // RP2040: SPDIF 3 on GPIO 10 (sub output, replaces PDM)
+//   static audio_spdif_instance_t spdif3_inst;
+//   audio_spdif_config_t spdif3_cfg = {
+//       .pio = pio1,                    // PDM used pio1; reuse it for SPDIF 3
+//       .pin = PICO_SPDIF_PIN_3,        // GPIO 10
+//       .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
+//   };
+//   audio_format_t spdif3_fmt = {
+//       .sample_freq = 48000,
+//       .format = AUDIO_BUFFER_FORMAT_PCM_S16,
+//       .channel_count = 2,
+//   };
+//   audio_spdif_setup(&spdif3_inst, &spdif3_fmt, &spdif3_cfg);
+//   spdif_instance_ptrs[2] = &spdif3_inst;
+//   // Create audio buffer pool for SPDIF 3
+//   spdif3_pool = audio_new_producer_pool(&spdif3_pool_fmt, 3, SPDIF3_BUFFER_SAMPLES);
+//   audio_spdif_connect(spdif3_pool, &spdif3_inst);
+//   audio_spdif_set_enabled(&spdif3_inst, true);
+// #endif
+
+// Declare the pool at file scope (near other pool declarations):
+// #if !PICO_RP2350
+// static audio_buffer_pool_t *spdif3_pool = NULL;
+// static audio_buffer_t      *spdif3_cur_buf = NULL;
+// static int                  spdif3_cur_pos = 0;
+// #define SPDIF3_BUFFER_SAMPLES 48
+// static audio_buffer_format_t spdif3_pool_fmt = {
+//     .format = { .sample_freq = 48000, .format = AUDIO_BUFFER_FORMAT_PCM_S16, .channel_count = 2 },
+//     .sample_stride = 4,
+// };
+// #endif
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 3: process_audio_packet() — replace pdm_push_sample
+// ──────────────────────────────────────────────────────────────
+// FIND (in the per-sample output loop, RP2040 path):
+//
+//   pdm_push_sample(buf_out[NUM_OUTPUT_CHANNELS-1][i], false);
+//   // or similar: pdm_push_sample(buf_out[pdm_out][i] * pdm_scale);
+//
+// REPLACE WITH:
+//
+// #if !PICO_RP2350
+//   // Feed matrix output 4 to SPDIF 3 (mono sub: same sample on both L and R)
+//   {
+//       if (!spdif3_cur_buf) {
+//           spdif3_cur_buf = take_audio_buffer(spdif3_pool, false);
+//           spdif3_cur_pos = 0;
+//       }
+//       if (spdif3_cur_buf) {
+//           int16_t *s = (int16_t *)spdif3_cur_buf->buffer->bytes;
+//           // buf_out is Q28 fixed-point on RP2040; shift to Q15 for int16
+//           int32_t raw = buf_out[NUM_OUTPUT_CHANNELS-1][i];
+//           // Clip
+//           if (raw >  (1 << 27)) raw =  (1 << 27);
+//           if (raw < -(1 << 27)) raw = -(1 << 27);
+//           int16_t samp = (int16_t)(raw >> 12); // Q28 → Q16 → int16
+//           s[spdif3_cur_pos * 2]     = samp;  // L
+//           s[spdif3_cur_pos * 2 + 1] = samp;  // R (mono sub: same signal)
+//           spdif3_cur_pos++;
+//           if (spdif3_cur_pos >= (int)spdif3_cur_buf->max_sample_count) {
+//               spdif3_cur_buf->sample_count = spdif3_cur_pos;
+//               give_audio_buffer(spdif3_pool, spdif3_cur_buf);
+//               spdif3_cur_buf = NULL;
+//           }
+//       }
+//   }
+// #endif
+
+// ──────────────────────────────────────────────────────────────
+// CHANGE 4: REQ_SET_OUTPUT_TYPE handler
+// ──────────────────────────────────────────────────────────────
+// The handler already uses NUM_SPDIF_INSTANCES to bound slot checks.
+// No extra changes needed — slot 2 is now valid for RP2040
+// because NUM_SPDIF_INSTANCES = 3, so the app's SetOutputSlotType(2, Spdif)
+// call will succeed and the app can switch between slots normally.

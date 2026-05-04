@@ -1,0 +1,70 @@
+// ============================================================
+// PATCH for firmware/DSPi/config.h
+// Change: Replace PDM sub output on GPIO 10 with S/PDIF 3
+// ============================================================
+//
+// FIND this block (RP2040 section):
+// -----------------------------------
+// #define PICO_PDM_PIN           10   // PDM sub (Out 9)
+// ...
+// #define NUM_SPDIF_INSTANCES  2
+// ...
+// #define NUM_CHANNELS     7
+// #define NUM_OUTPUT_CHANNELS  5
+//
+// REPLACE WITH:
+// -----------------------------------
+
+// ---------- GPIO pin assignments ----------
+#define PICO_AUDIO_SPDIF_PIN   6    // S/PDIF 1 (Out 1-2)
+#define PICO_SPDIF_PIN_2       7    // S/PDIF 2 (Out 3-4)
+#if PICO_RP2350
+#define PICO_SPDIF_PIN_3       8    // S/PDIF 3 (Out 5-6)
+#define PICO_SPDIF_PIN_4       9    // S/PDIF 4 (Out 7-8)
+#define PICO_PDM_PIN           10   // PDM sub (Out 9) -- RP2350 keeps PDM
+#else
+#define PICO_SPDIF_PIN_3       10   // S/PDIF 3 Sub Out (RP2040: was PDM, now SPDIF)
+// PICO_PDM_PIN intentionally removed for RP2040 -- GPIO 10 now outputs S/PDIF 3
+#endif
+#define PICO_I2S_BCK_PIN       14
+#define PICO_I2S_MCK_PIN       13
+
+// ---------- SPDIF instance count ----------
+#if PICO_RP2350
+#define NUM_SPDIF_INSTANCES  4
+#else
+#define NUM_SPDIF_INSTANCES  3   // RP2040: added SPDIF 3 (sub) on GPIO 10
+#endif
+
+// ---------- Channel counts ----------
+// NOTE: NUM_CHANNELS and NUM_OUTPUT_CHANNELS stay the same.
+// Matrix output 4 (formerly PDM mono) now feeds SPDIF 3 (mono → both L+R).
+// Bulk params format is unchanged; app needs no modifications.
+#if PICO_RP2350
+#define NUM_CHANNELS         11
+#define NUM_OUTPUT_CHANNELS  9
+#else
+#define NUM_CHANNELS         7   // unchanged
+#define NUM_OUTPUT_CHANNELS  5   // unchanged (output[4] = SPDIF 3 sub mono)
+#endif
+
+// ---------- PDM defines (RP2040: disable) ----------
+#if PICO_RP2350
+// RP2350 keeps PDM hardware
+#define PDM_PIO  pio1
+#define PDM_SM   0
+// ... rest of PDM defines for RP2350 unchanged
+#else
+// RP2040: PDM is DISABLED. Define guard so code compiles without errors.
+// The ENABLE_SUB macro must be set to 0 (or removed) for RP2040.
+#undef  ENABLE_SUB
+#define ENABLE_SUB 0
+#endif
+
+// ---------- NUM_PIN_OUTPUTS ----------
+// Must equal NUM_SPDIF_INSTANCES (RP2040: 3, RP2350: 5)
+#if PICO_RP2350
+#define NUM_PIN_OUTPUTS  5   // 4 SPDIF + 1 PDM
+#else
+#define NUM_PIN_OUTPUTS  3   // 3 SPDIF (no PDM on RP2040)
+#endif
